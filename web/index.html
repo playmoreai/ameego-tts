@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ameego TTS</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0d0d1a;
+      color: #e0e0e0;
+      min-height: 100vh;
+    }
+
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 24px 16px;
+    }
+
+    /* Header */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 24px;
+    }
+    header h1 {
+      font-size: 24px;
+      font-weight: 600;
+      color: #fff;
+    }
+    .status-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    #status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #888;
+    }
+    #status-text {
+      font-size: 13px;
+      color: #aaa;
+    }
+    #connect-btn {
+      padding: 6px 14px;
+      font-size: 13px;
+      border: 1px solid #444;
+      background: transparent;
+      color: #e0e0e0;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    #connect-btn:hover { background: #222; }
+
+    /* Cards */
+    .card {
+      background: #141428;
+      border: 1px solid #222;
+      border-radius: 10px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    .card-title {
+      font-size: 14px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #888;
+      margin-bottom: 14px;
+    }
+
+    /* Voice mode */
+    .voice-mode-group {
+      display: flex;
+      gap: 16px;
+      margin-bottom: 14px;
+    }
+    .voice-mode-group label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    /* Clone panel */
+    #clone-panel {
+      display: none;
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid #222;
+    }
+    .clone-row {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 10px;
+      align-items: center;
+    }
+    .clone-row input[type="file"] {
+      flex: 1;
+      font-size: 13px;
+    }
+    .clone-row input[type="text"] {
+      flex: 1;
+      padding: 8px 10px;
+      background: #0d0d1a;
+      border: 1px solid #333;
+      border-radius: 6px;
+      color: #e0e0e0;
+      font-size: 13px;
+    }
+    .clone-status { font-size: 12px; color: #888; margin-top: 4px; }
+    .clone-status.success { color: #5cb85c; }
+    .clone-status.error { color: #d9534f; }
+    .synthesis-error { font-size: 13px; color: #d9534f; margin-top: 8px; }
+
+    /* Text input */
+    textarea {
+      width: 100%;
+      height: 120px;
+      padding: 12px;
+      background: #0d0d1a;
+      border: 1px solid #333;
+      border-radius: 8px;
+      color: #e0e0e0;
+      font-size: 15px;
+      font-family: inherit;
+      resize: vertical;
+      margin-bottom: 12px;
+    }
+    textarea:focus { outline: none; border-color: #00d4ff; }
+
+    /* Controls row */
+    .controls-row {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    select, .slider-group {
+      padding: 8px 10px;
+      background: #0d0d1a;
+      border: 1px solid #333;
+      border-radius: 6px;
+      color: #e0e0e0;
+      font-size: 13px;
+    }
+    .slider-group {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      border: none;
+      padding: 0;
+    }
+    .slider-group label { font-size: 13px; color: #888; white-space: nowrap; }
+    .slider-group input[type="range"] { width: 80px; }
+    .slider-group span { font-size: 13px; min-width: 20px; }
+
+    .btn-primary {
+      padding: 8px 24px;
+      background: #00d4ff;
+      color: #000;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    .btn-primary:hover { opacity: 0.85; }
+    .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .btn-secondary {
+      padding: 8px 16px;
+      background: transparent;
+      border: 1px solid #444;
+      color: #e0e0e0;
+      border-radius: 6px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .btn-secondary:disabled { opacity: 0.3; cursor: not-allowed; }
+    .btn-secondary:hover:not(:disabled) { background: #222; }
+
+    .btn-danger {
+      padding: 8px 16px;
+      background: #d9534f;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .btn-danger:disabled { opacity: 0.3; cursor: not-allowed; }
+
+    /* Waveform */
+    #waveform {
+      width: 100%;
+      height: 100px;
+      border-radius: 6px;
+      background: #1a1a2e;
+    }
+
+    /* Output row */
+    .output-row {
+      display: flex;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    /* Metrics */
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 12px;
+    }
+    .metric {
+      text-align: center;
+    }
+    .metric-value {
+      font-size: 20px;
+      font-weight: 700;
+      color: #00d4ff;
+    }
+    .metric-label {
+      font-size: 11px;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-top: 2px;
+    }
+
+    @media (max-width: 600px) {
+      .metrics-grid { grid-template-columns: repeat(3, 1fr); }
+      .controls-row { flex-direction: column; align-items: stretch; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Ameego TTS</h1>
+      <div class="status-bar">
+        <div id="status-dot"></div>
+        <span id="status-text">Disconnected</span>
+        <button id="connect-btn">Connect</button>
+      </div>
+    </header>
+
+    <!-- Voice Selection -->
+    <div class="card">
+      <div class="card-title">Voice</div>
+      <div class="voice-mode-group">
+        <label>
+          <input type="radio" name="voice-mode" value="default" checked>
+          Default Voice
+        </label>
+        <label>
+          <input type="radio" name="voice-mode" value="clone">
+          Voice Clone
+        </label>
+      </div>
+      <div id="clone-panel">
+        <div class="clone-row">
+          <input type="file" id="ref-audio" accept="audio/*">
+        </div>
+        <div class="clone-row">
+          <input type="text" id="ref-text" placeholder="Transcription of reference audio...">
+          <button id="create-voice-btn" class="btn-secondary">Create Voice</button>
+        </div>
+        <div id="clone-status" class="clone-status"></div>
+      </div>
+    </div>
+
+    <!-- Synthesis -->
+    <div class="card">
+      <div class="card-title">Synthesis</div>
+      <textarea id="text-input" placeholder="Enter text to synthesize..."></textarea>
+      <div class="controls-row">
+        <select id="language-select">
+          <option value="English">English</option>
+          <option value="Chinese">Chinese</option>
+          <option value="Japanese">Japanese</option>
+          <option value="Korean">Korean</option>
+          <option value="German">German</option>
+          <option value="French">French</option>
+          <option value="Russian">Russian</option>
+          <option value="Portuguese">Portuguese</option>
+          <option value="Spanish">Spanish</option>
+          <option value="Italian">Italian</option>
+        </select>
+        <div class="slider-group">
+          <label>Chunk:</label>
+          <input type="range" id="chunk-size" min="1" max="12" value="2">
+          <span id="chunk-size-value">2</span>
+        </div>
+        <button id="speak-btn" class="btn-primary" disabled>Speak</button>
+        <button id="stop-btn" class="btn-danger" disabled>Stop</button>
+      </div>
+      <div id="synthesis-error" class="synthesis-error"></div>
+    </div>
+
+    <!-- Output -->
+    <div class="card">
+      <div class="card-title">Output</div>
+      <canvas id="waveform"></canvas>
+      <div class="output-row">
+        <button id="download-btn" class="btn-secondary" disabled>Download WAV</button>
+      </div>
+    </div>
+
+    <!-- Metrics -->
+    <div class="card">
+      <div class="card-title">Metrics</div>
+      <div class="metrics-grid">
+        <div class="metric">
+          <div class="metric-value" id="metric-ttfa">-</div>
+          <div class="metric-label">TTFA</div>
+        </div>
+        <div class="metric">
+          <div class="metric-value" id="metric-rtf">-</div>
+          <div class="metric-label">RTF</div>
+        </div>
+        <div class="metric">
+          <div class="metric-value" id="metric-duration">-</div>
+          <div class="metric-label">Duration</div>
+        </div>
+        <div class="metric">
+          <div class="metric-value" id="metric-chunks">-</div>
+          <div class="metric-label">Chunks</div>
+        </div>
+        <div class="metric">
+          <div class="metric-value" id="metric-buffer">-</div>
+          <div class="metric-label">Buffer</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

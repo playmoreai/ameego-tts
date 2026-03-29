@@ -1,0 +1,17 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '--build-arg'
+      - 'MODEL_SIZE=${_MODEL_SIZE}'
+      - '-t'
+      - '${_IMAGE_TAG}'
+      - '.'
+    timeout: '3600s'
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '${_IMAGE_TAG}']
+images:
+  - '${_IMAGE_TAG}'
+timeout: '3600s'
+options:
+  machineType: 'E2_HIGHCPU_32'
