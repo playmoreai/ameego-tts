@@ -495,7 +495,8 @@ class AmeegoTTSClient {
   }
 }
 
-// Initialize when DOM is ready
+// Initialize when DOM is ready and auto-connect
 document.addEventListener('DOMContentLoaded', () => {
   window.ttsClient = new AmeegoTTSClient();
+  window.ttsClient.connect();
 });
