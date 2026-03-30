@@ -24,8 +24,8 @@ def main():
     parser = argparse.ArgumentParser(description="Download Qwen3-TTS models")
     parser.add_argument(
         "--model-sizes",
-        default="0.6B,1.7B",
-        help="Comma-separated model sizes to download (default: 0.6B,1.7B)",
+        default="1.7B",
+        help="Comma-separated model sizes to download (default: 1.7B)",
     )
     parser.add_argument(
         "--cache-dir",

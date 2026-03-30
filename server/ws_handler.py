@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import logging
 import struct
@@ -10,6 +9,7 @@ import time
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from server.audio_utils import decode_audio_base64
 from server.config import SUPPORTED_LANGUAGES, settings
 from server.models import (
     ALLOWED_AUDIO_FORMATS,
@@ -142,11 +142,11 @@ async def _handle_synthesize(
         return
 
     if req.mode == "voice_design":
-        if req.voice_clone_prompt_id:
+        if req.voice_clone_prompt_id or req.voice_id:
             await _send_error(
                 ws,
                 "INVALID_REQUEST",
-                "voice_clone_prompt_id is not allowed in voice design mode.",
+                "voice_clone_prompt_id and voice_id are not allowed in voice design mode.",
                 req.request_id,
             )
             return
@@ -158,6 +158,14 @@ async def _handle_synthesize(
                 req.request_id,
             )
             return
+    elif req.voice_clone_prompt_id and req.voice_id:
+        await _send_error(
+            ws,
+            "INVALID_REQUEST",
+            "voice_clone_prompt_id and voice_id cannot be used together.",
+            req.request_id,
+        )
+        return
 
     ref_audio_path = None
     voice_clone_prompt = None
@@ -166,20 +174,29 @@ async def _handle_synthesize(
         async with runtime.acquire_request_engine(
             mode=req.mode,
             clone_model_size=req.model,
-        ) as engine:
-            if req.mode == "voice_clone" and req.voice_clone_prompt_id:
-                voice_clone_prompt = engine.get_voice_prompt(req.voice_clone_prompt_id)
-                if voice_clone_prompt is None:
-                    path = engine.get_ref_audio_path(req.voice_clone_prompt_id)
-                    if path is None:
-                        await _send_error(
-                            ws,
-                            "PROMPT_NOT_FOUND",
-                            f"Voice clone prompt not found: {req.voice_clone_prompt_id}",
-                            req.request_id,
-                        )
-                        return
-                    ref_audio_path = str(path)
+            prompt_id=req.voice_clone_prompt_id,
+        ) as lease:
+            engine = lease.engine
+            if req.mode == "voice_clone":
+                if req.voice_id:
+                    _, voice_clone_prompt = await runtime.ensure_voice_prompt_for_replica(
+                        replica=lease.replica,
+                        voice_id=req.voice_id,
+                    )
+                elif req.voice_clone_prompt_id:
+                    local_prompt_id = lease.local_prompt_id
+                    voice_clone_prompt = engine.get_voice_prompt(local_prompt_id)
+                    if voice_clone_prompt is None:
+                        path = engine.get_ref_audio_path(local_prompt_id)
+                        if path is None:
+                            await _send_error(
+                                ws,
+                                "PROMPT_NOT_FOUND",
+                                f"Voice clone prompt not found: {req.voice_clone_prompt_id}",
+                                req.request_id,
+                            )
+                            return
+                        ref_audio_path = str(path)
 
             await ws.send_json(
                 SynthesisStart(
@@ -291,31 +308,12 @@ async def _handle_upload_ref_audio(
         return
 
     try:
-        audio_base64 = "".join(req.audio_base64.split())
-        audio_bytes = base64.b64decode(audio_base64, validate=True)
-    except Exception:
+        audio_bytes = decode_audio_base64(req.audio_base64)
+    except ValueError as e:
         await _send_error(
             ws,
             "INVALID_AUDIO",
-            "Invalid base64-encoded audio data.",
-            req.request_id,
-        )
-        return
-
-    if len(audio_bytes) < 1000:
-        await _send_error(
-            ws,
-            "INVALID_AUDIO",
-            "Reference audio is too short. Please provide at least 3 seconds.",
-            req.request_id,
-        )
-        return
-
-    if len(audio_bytes) > 10 * 1024 * 1024:
-        await _send_error(
-            ws,
-            "INVALID_AUDIO",
-            "Reference audio exceeds 10MB limit.",
+            str(e),
             req.request_id,
         )
         return
@@ -326,10 +324,13 @@ async def _handle_upload_ref_audio(
         async with runtime.acquire_request_engine(
             mode="voice_clone",
             clone_model_size=req.model,
-        ) as engine:
-            prompt_id, _ = engine.save_ref_audio(audio_bytes, fmt)
-            precompute_ms = await engine.run_on_gpu(engine.precompute_voice_prompt, prompt_id)
+            purpose="precompute",
+        ) as lease:
+            engine = lease.engine
+            local_prompt_id, _ = engine.save_ref_audio(audio_bytes, fmt)
+            precompute_ms = await engine.run_on_gpu(engine.precompute_voice_prompt, local_prompt_id)
             elapsed = (time.perf_counter() - t0) * 1000
+            prompt_id = runtime.encode_prompt_id(lease.replica.replica_id, local_prompt_id)
 
             await ws.send_json(
                 VoiceClonePromptReady(

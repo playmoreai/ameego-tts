@@ -17,6 +17,7 @@ class SynthesizeRequest(BaseModel):
     mode: Literal["voice_clone", "voice_design"] = "voice_clone"
     model: str | None = None
     instruct: str | None = None
+    voice_id: str | None = None
     voice_clone_prompt_id: str | None = None
     chunk_size: int | None = Field(default=None, ge=1, le=24)
 
@@ -33,6 +34,28 @@ class UploadRefAudioRequest(BaseModel):
 class ModeSwitchRequest(BaseModel):
     mode: Literal["voice_clone", "voice_design"]
     model: str | None = None
+
+
+class CreateVoiceRequest(BaseModel):
+    audio_base64: str
+    audio_format: str = "wav"
+    display_name: str | None = Field(default=None, max_length=128)
+
+
+class VoiceCreatedResponse(BaseModel):
+    voice_id: str
+    audio_format: str
+    duration_ms: float
+    created_at: str
+    display_name: str | None = None
+
+
+class VoiceMetadataResponse(BaseModel):
+    voice_id: str
+    audio_format: str
+    duration_ms: float | None = None
+    created_at: str | None = None
+    display_name: str | None = None
 
 
 # --- Server -> Client messages ---

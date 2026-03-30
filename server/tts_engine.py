@@ -10,13 +10,16 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Literal, TypeVar
 
 import numpy as np
 import soundfile as sf
 
+from server.audio_utils import normalize_audio_to_wav
 from server.config import Settings
+from server.voice_store import VoiceStore
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +36,7 @@ if _VENDORED_PACKAGE_ROOT.exists():
 _REF_AUDIO_DIR = Path(tempfile.gettempdir()) / "ameego_tts_ref"
 _REF_AUDIO_DIR.mkdir(exist_ok=True)
 _DEFAULT_REF_PATH = _REF_AUDIO_DIR / "_default_ref.wav"
+_PROMPT_ID_SEPARATOR = ":"
 
 
 def _create_default_ref_audio(sample_rate: int = 24000) -> Path:
@@ -174,30 +178,31 @@ class TTSEngine:
         wav_path = _REF_AUDIO_DIR / f"{hash_key}.wav"
 
         if not wav_path.exists():
-            if audio_format.lower() == "wav":
-                wav_path.write_bytes(audio_bytes)
-            else:
-                tmp_path = _REF_AUDIO_DIR / f"{hash_key}_tmp.{audio_format}"
-                try:
-                    tmp_path.write_bytes(audio_bytes)
-                    data, sr = sf.read(str(tmp_path))
-                    sf.write(str(wav_path), data, sr)
-                    logger.info(
-                        "Converted ref audio %s->WAV: sr=%d, duration=%.1fs",
-                        audio_format,
-                        sr,
-                        len(data) / sr,
-                    )
-                except Exception as e:
-                    raise ValueError(f"Failed to convert {audio_format} to WAV: {e}") from e
-                finally:
-                    tmp_path.unlink(missing_ok=True)
+            try:
+                duration_ms = normalize_audio_to_wav(
+                    audio_bytes=audio_bytes,
+                    audio_format=audio_format,
+                    output_path=wav_path,
+                )
+                logger.info(
+                    "Normalized ref audio %s->WAV: duration=%.1fms",
+                    audio_format,
+                    duration_ms,
+                )
+            except Exception as e:
+                raise ValueError(f"Failed to normalize {audio_format} reference audio: {e}") from e
 
         self._ref_audio_cache[hash_key] = wav_path
         self._ref_audio_cache.move_to_end(hash_key)
         while len(self._ref_audio_cache) > self.config.clone_prompt_cache_size:
             self._ref_audio_cache.popitem(last=False)
         return hash_key, wav_path
+
+    def cache_ref_audio_path(self, prompt_id: str, wav_path: Path) -> None:
+        self._ref_audio_cache[prompt_id] = wav_path
+        self._ref_audio_cache.move_to_end(prompt_id)
+        while len(self._ref_audio_cache) > self.config.clone_prompt_cache_size:
+            self._ref_audio_cache.popitem(last=False)
 
     def precompute_voice_prompt(self, prompt_id: str) -> float:
         if self.engine_mode != "voice_clone":
@@ -290,9 +295,7 @@ class TTSEngine:
                 chunk_size,
             )
 
-        for i, (audio_chunk, sr, _) in enumerate(
-            self.model.generate_voice_clone_streaming(**kwargs)
-        ):
+        for i, (audio_chunk, sr, _) in enumerate(self.model.generate_voice_clone_streaming(**kwargs)):
             if cancel_event and cancel_event.is_set():
                 logger.info("[%s] Clone synthesis cancelled at chunk %d", self.model_key, i)
                 break
@@ -425,13 +428,82 @@ class TTSEngine:
                 await task
 
 
+@dataclass
+class EngineReplica:
+    replica_id: str
+    engine: TTSEngine
+    active_jobs: int = 0
+
+    @property
+    def is_idle(self) -> bool:
+        return self.active_jobs == 0
+
+
+@dataclass
+class EngineLease:
+    replica: EngineReplica
+    local_prompt_id: str | None = None
+
+    @property
+    def engine(self) -> TTSEngine:
+        return self.replica.engine
+
+
+@dataclass
+class RuntimePool:
+    mode: RuntimeMode
+    clone_model_size: str | None
+    model_key: str
+    model_id: str
+    replicas: list[EngineReplica]
+
+    @property
+    def total_replicas(self) -> int:
+        return len(self.replicas)
+
+    @property
+    def busy_replicas(self) -> int:
+        return sum(1 for replica in self.replicas if replica.active_jobs > 0)
+
+    @property
+    def available_capacity(self) -> int:
+        return self.total_replicas - self.busy_replicas
+
+    def get_replica(self, replica_id: str) -> EngineReplica | None:
+        for replica in self.replicas:
+            if replica.replica_id == replica_id:
+                return replica
+        return None
+
+    def first_idle_replica(self) -> EngineReplica | None:
+        for replica in self.replicas:
+            if replica.is_idle:
+                return replica
+        return None
+
+    def least_busy_replica(self) -> EngineReplica | None:
+        if not self.replicas:
+            return None
+        return min(self.replicas, key=lambda replica: (replica.active_jobs, replica.replica_id))
+
+    def descriptor(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "clone_model_size": self.clone_model_size,
+            "model_key": self.model_key,
+            "model_id": self.model_id,
+            "replica_count": self.total_replicas,
+        }
+
+
 class TTSRuntime:
     def __init__(self, config: Settings):
         self.config = config
-        self._gpu_lock = asyncio.Lock()
+        self.voice_store = VoiceStore(config.voice_storage_dir or None)
         self._state_lock = asyncio.Lock()
-        self._engine: TTSEngine | None = None
-        self._active_jobs = 0
+        self._state_changed = asyncio.Condition(self._state_lock)
+        self._pool: RuntimePool | None = None
+        self._waiting_synth_requests = 0
         self.runtime_generation = 0
         self.runtime_status: Literal["loading", "ready", "switching", "error"] = "loading"
         self.active_mode: RuntimeMode = config.initial_mode
@@ -458,12 +530,87 @@ class TTSRuntime:
             )
         return resolved
 
+    def replica_count_for(self, target_mode: RuntimeMode, clone_model_size: str) -> int:
+        if target_mode == "voice_design":
+            return self.config.voice_design_replicas
+        if clone_model_size == "0.6B":
+            return self.config.clone_0_6b_replicas
+        if clone_model_size == "1.7B":
+            return self.config.clone_1_7b_replicas
+        raise RuntimeStateError("INVALID_MODEL", f"Unknown clone model: {clone_model_size}")
+
+    def encode_prompt_id(
+        self,
+        replica_id: str,
+        local_prompt_id: str,
+        runtime_generation: int | None = None,
+    ) -> str:
+        generation = self.runtime_generation if runtime_generation is None else runtime_generation
+        return f"g{generation}{_PROMPT_ID_SEPARATOR}{replica_id}{_PROMPT_ID_SEPARATOR}{local_prompt_id}"
+
+    def decode_prompt_id(self, prompt_id: str) -> tuple[int, str, str]:
+        generation_token, separator, remainder = prompt_id.partition(_PROMPT_ID_SEPARATOR)
+        replica_id, separator2, local_prompt_id = remainder.partition(_PROMPT_ID_SEPARATOR)
+        if (
+            not separator
+            or not separator2
+            or not generation_token.startswith("g")
+            or not replica_id
+            or not local_prompt_id
+        ):
+            raise RuntimeStateError("PROMPT_NOT_FOUND", f"Voice clone prompt not found: {prompt_id}")
+        try:
+            generation = int(generation_token[1:])
+        except ValueError as exc:
+            raise RuntimeStateError("PROMPT_NOT_FOUND", f"Voice clone prompt not found: {prompt_id}") from exc
+        return generation, replica_id, local_prompt_id
+
+    async def ensure_voice_prompt_for_replica(
+        self,
+        *,
+        replica: EngineReplica,
+        voice_id: str,
+    ) -> tuple[str, dict]:
+        stored_voice = self.voice_store.get_voice(voice_id)
+        if stored_voice is None:
+            raise RuntimeStateError("VOICE_NOT_FOUND", f"Voice not found: {voice_id}")
+
+        local_prompt_id = f"voice:{voice_id}"
+        engine = replica.engine
+        voice_prompt = engine.get_voice_prompt(local_prompt_id)
+        if voice_prompt is not None:
+            return local_prompt_id, voice_prompt
+
+        engine.cache_ref_audio_path(local_prompt_id, stored_voice.audio_path)
+        await engine.run_on_gpu(engine.precompute_voice_prompt, local_prompt_id)
+        voice_prompt = engine.get_voice_prompt(local_prompt_id)
+        if voice_prompt is None:
+            raise RuntimeStateError("VOICE_ASSET_ERROR", f"Failed to prepare voice: {voice_id}")
+        return local_prompt_id, voice_prompt
+
     async def initialize(self) -> None:
         await self._load_into_runtime(self.active_mode, self.active_clone_model_size)
 
-    async def _build_engine(self, target_mode: RuntimeMode, clone_model_size: str) -> TTSEngine:
+    async def shutdown(self) -> None:
+        async with self._state_lock:
+            pool = self._pool
+            self._pool = None
+            self._waiting_synth_requests = 0
+            self.runtime_status = "loading"
+            self.message = None
+            self.switch_target_mode = None
+            self.switch_target_clone_model_size = None
+            self.active_model_id = None
+            self._state_changed.notify_all()
+        await self._release_pool(pool)
+
+    async def _build_engine(
+        self,
+        target_mode: RuntimeMode,
+        model_key: str,
+        model_id: str,
+    ) -> TTSEngine:
         loop = asyncio.get_running_loop()
-        model_key, model_id = self._resolve_target(target_mode, clone_model_size)
 
         def _build() -> TTSEngine:
             engine = TTSEngine.from_model_id(
@@ -471,20 +618,55 @@ class TTSRuntime:
                 engine_mode=target_mode,
                 model_key=model_key,
                 model_id=model_id,
-                gpu_lock=self._gpu_lock,
             )
             engine.warm_up()
             return engine
 
         return await loop.run_in_executor(None, _build)
 
-    async def _release_engine(self, engine: TTSEngine | None) -> None:
-        if engine is None:
+    async def _build_pool(self, target_mode: RuntimeMode, clone_model_size: str) -> RuntimePool:
+        model_key, model_id = self._resolve_target(target_mode, clone_model_size)
+        replica_count = self.replica_count_for(target_mode, clone_model_size)
+        replicas: list[EngineReplica] = []
+        try:
+            for index in range(replica_count):
+                engine = await self._build_engine(target_mode, model_key, model_id)
+                replica_label = "vd" if target_mode == "voice_design" else clone_model_size.lower().replace(".", "")
+                replica_id = f"{replica_label}-r{index + 1}"
+                replicas.append(EngineReplica(replica_id=replica_id, engine=engine))
+        except Exception:
+            if replicas:
+                await self._release_pool(
+                    RuntimePool(
+                        mode=target_mode,
+                        clone_model_size=clone_model_size if target_mode == "voice_clone" else None,
+                        model_key=model_key,
+                        model_id=model_id,
+                        replicas=replicas,
+                    )
+                )
+            raise
+
+        return RuntimePool(
+            mode=target_mode,
+            clone_model_size=clone_model_size if target_mode == "voice_clone" else None,
+            model_key=model_key,
+            model_id=model_id,
+            replicas=replicas,
+        )
+
+    async def _release_pool(self, pool: RuntimePool | None) -> None:
+        if pool is None:
             return
         loop = asyncio.get_running_loop()
 
         def _cleanup() -> None:
-            engine.clear_voice_clone_cache()
+            for replica in pool.replicas:
+                engine = replica.engine
+                engine.clear_voice_clone_cache()
+                engine.model = None
+                replica.active_jobs = 0
+            pool.replicas.clear()
             gc.collect()
             try:
                 import torch
@@ -509,23 +691,42 @@ class TTSRuntime:
     async def _load_into_runtime(self, target_mode: RuntimeMode, clone_model_size: str) -> None:
         async with self._state_lock:
             self.runtime_status = "loading"
+            self._waiting_synth_requests = 0
             self.message = None
             self.switch_target_mode = None
             self.switch_target_clone_model_size = None
+            self._state_changed.notify_all()
 
-        engine = await self._build_engine(target_mode, clone_model_size)
+        pool = await self._build_pool(target_mode, clone_model_size)
 
+        await self._activate_pool(pool, target_mode=target_mode, clone_model_size=clone_model_size)
+
+    async def _activate_pool(
+        self,
+        pool: RuntimePool,
+        *,
+        target_mode: RuntimeMode,
+        clone_model_size: str,
+    ) -> None:
         async with self._state_lock:
-            self._engine = engine
+            self._pool = pool
             self.active_mode = target_mode
-            self.active_model_id = engine.model_id
+            self.active_model_id = pool.model_id
             self.runtime_generation += 1
+            self._waiting_synth_requests = 0
             if target_mode == "voice_clone":
                 self.active_clone_model_size = clone_model_size
             self.runtime_status = "ready"
             self.message = None
+            self.switch_target_mode = None
+            self.switch_target_clone_model_size = None
+            self._state_changed.notify_all()
 
     def health_payload(self) -> dict[str, Any]:
+        pool = self._pool
+        busy_replicas = pool.busy_replicas if pool else 0
+        active_replicas = pool.total_replicas if pool else 0
+        available_capacity = pool.available_capacity if pool else 0
         return {
             "status": self.runtime_status,
             "active_mode": self.active_mode,
@@ -540,6 +741,14 @@ class TTSRuntime:
             "default_model": self.default_clone_model_size,
             "default_clone_model_size": self.default_clone_model_size,
             "runtime_generation": self.runtime_generation,
+            "active_profile": self.config.app_profile,
+            "mode_switch_enabled": self.config.app_profile == "test",
+            "active_replica_count": active_replicas,
+            "busy_replica_count": busy_replicas,
+            "available_synth_capacity": available_capacity,
+            "waiting_synth_requests": self._waiting_synth_requests,
+            "max_waiting_synth_requests": self.config.max_waiting_synth_requests,
+            "current_pool": pool.descriptor() if pool else None,
         }
 
     async def start_mode_switch(
@@ -555,12 +764,13 @@ class TTSRuntime:
         )
 
         async with self._state_lock:
+            pool = self._pool
             if self.runtime_status == "switching":
                 return {
                     "status": "busy",
                     "message": "Model switch already in progress.",
                 }
-            if self._active_jobs > 0:
+            if pool and (pool.busy_replicas > 0 or self._waiting_synth_requests > 0):
                 return {
                     "status": "busy",
                     "message": "The server is busy. Try again after the current task finishes.",
@@ -590,9 +800,8 @@ class TTSRuntime:
                 target_clone_model_size if target_mode == "voice_clone" else None
             )
             self.message = None
-            asyncio.create_task(
-                self._perform_switch(target_mode, target_clone_model_size)
-            )
+            self._state_changed.notify_all()
+            asyncio.create_task(self._perform_switch(target_mode, target_clone_model_size))
 
         return {
             "status": "switching",
@@ -602,35 +811,31 @@ class TTSRuntime:
         }
 
     async def _perform_switch(self, target_mode: RuntimeMode, clone_model_size: str) -> None:
-        old_engine: TTSEngine | None = None
+        old_pool: RuntimePool | None = None
         async with self._state_lock:
-            old_engine = self._engine
-            self._engine = None
+            old_pool = self._pool
+            self._pool = None
 
         try:
-            await self._release_engine(old_engine)
-            new_engine = await self._build_engine(target_mode, clone_model_size)
+            await self._release_pool(old_pool)
+            new_pool = await self._build_pool(target_mode, clone_model_size)
         except Exception as e:
             logger.error("Failed to switch runtime to %s/%s: %s", target_mode, clone_model_size, e)
             async with self._state_lock:
                 self.runtime_status = "error"
+                self._waiting_synth_requests = 0
                 self.message = str(e)
                 self.switch_target_mode = None
                 self.switch_target_clone_model_size = None
                 self.active_model_id = None
+                self._state_changed.notify_all()
             return
 
-        async with self._state_lock:
-            self._engine = new_engine
-            self.active_mode = target_mode
-            self.active_model_id = new_engine.model_id
-            self.runtime_generation += 1
-            if target_mode == "voice_clone":
-                self.active_clone_model_size = clone_model_size
-            self.runtime_status = "ready"
-            self.message = None
-            self.switch_target_mode = None
-            self.switch_target_clone_model_size = None
+        await self._activate_pool(
+            new_pool,
+            target_mode=target_mode,
+            clone_model_size=clone_model_size,
+        )
 
     @asynccontextmanager
     async def acquire_request_engine(
@@ -638,46 +843,101 @@ class TTSRuntime:
         *,
         mode: RuntimeMode,
         clone_model_size: str | None = None,
+        prompt_id: str | None = None,
+        purpose: Literal["synthesize", "precompute"] = "synthesize",
     ):
         normalized_clone_model_size = (
             self.normalize_clone_model_size(clone_model_size)
             if mode == "voice_clone"
             else self.active_clone_model_size
         )
-        async with self._state_lock:
-            if mode == "voice_design" and not self.config.voice_design_enabled:
-                raise RuntimeStateError(
-                    "VOICE_DESIGN_DISABLED",
-                    "Voice Design is not enabled on this deployment.",
-                )
-            if self.runtime_status == "switching":
-                raise RuntimeStateError(
-                    "MODE_SWITCH_IN_PROGRESS",
-                    "The server is switching models. Try again when it is ready.",
-                )
-            if self.runtime_status != "ready" or self._engine is None:
-                raise RuntimeStateError(
-                    "MODE_NOT_READY",
-                    "The requested mode is not ready yet.",
-                )
-            if mode != self.active_mode:
-                raise RuntimeStateError(
-                    "MODE_NOT_READY",
-                    f"The server is ready for {self.active_mode}, not {mode}.",
-                )
-            if (
-                mode == "voice_clone"
-                and normalized_clone_model_size != self.active_clone_model_size
-            ):
-                raise RuntimeStateError(
-                    "MODE_NOT_READY",
-                    f"The clone model {normalized_clone_model_size} is not active yet.",
-                )
-            self._active_jobs += 1
-            engine = self._engine
+        queued = False
+        acquired = False
+        async with self._state_changed:
+            try:
+                while True:
+                    pool = self._pool
+                    if mode == "voice_design" and not self.config.voice_design_enabled:
+                        raise RuntimeStateError(
+                            "VOICE_DESIGN_DISABLED",
+                            "Voice Design is not enabled on this deployment.",
+                        )
+                    if self.runtime_status == "switching":
+                        raise RuntimeStateError(
+                            "MODE_SWITCH_IN_PROGRESS",
+                            "The server is switching models. Try again when it is ready.",
+                        )
+                    if self.runtime_status != "ready" or pool is None:
+                        raise RuntimeStateError(
+                            "MODE_NOT_READY",
+                            "The requested mode is not ready yet.",
+                        )
+                    if mode != self.active_mode:
+                        raise RuntimeStateError(
+                            "MODE_NOT_READY",
+                            f"The server is ready for {self.active_mode}, not {mode}.",
+                        )
+                    if (
+                        mode == "voice_clone"
+                        and normalized_clone_model_size != self.active_clone_model_size
+                    ):
+                        raise RuntimeStateError(
+                            "MODE_NOT_READY",
+                            f"The clone model {normalized_clone_model_size} is not active yet.",
+                        )
+
+                    local_prompt_id = None
+                    if prompt_id:
+                        generation, replica_id, local_prompt_id = self.decode_prompt_id(prompt_id)
+                        if generation != self.runtime_generation:
+                            raise RuntimeStateError(
+                                "PROMPT_NOT_FOUND",
+                                f"Voice clone prompt not found: {prompt_id}",
+                            )
+                        replica = pool.get_replica(replica_id)
+                        if replica is None:
+                            raise RuntimeStateError(
+                                "PROMPT_NOT_FOUND",
+                                f"Voice clone prompt not found: {prompt_id}",
+                            )
+                        if replica.active_jobs == 0:
+                            replica.active_jobs += 1
+                            acquired = True
+                            break
+                    else:
+                        replica = pool.first_idle_replica()
+                        if replica is not None:
+                            replica.active_jobs += 1
+                            acquired = True
+                            break
+
+                    action = "synthesis" if purpose == "synthesize" else "voice prompt preparation"
+                    if purpose != "synthesize":
+                        raise RuntimeStateError(
+                            "SERVER_BUSY",
+                            f"No idle capacity is available for {action}. Try again shortly.",
+                        )
+                    if not queued:
+                        if self._waiting_synth_requests >= self.config.max_waiting_synth_requests:
+                            raise RuntimeStateError(
+                                "SERVER_BUSY",
+                                f"No idle capacity is available for {action}. Try again shortly.",
+                            )
+                        self._waiting_synth_requests += 1
+                        queued = True
+                    await self._state_changed.wait()
+            finally:
+                if queued and not acquired:
+                    self._waiting_synth_requests = max(0, self._waiting_synth_requests - 1)
+                    self._state_changed.notify_all()
+
+            if queued:
+                self._waiting_synth_requests = max(0, self._waiting_synth_requests - 1)
+                self._state_changed.notify_all()
 
         try:
-            yield engine
+            yield EngineLease(replica=replica, local_prompt_id=local_prompt_id)
         finally:
-            async with self._state_lock:
-                self._active_jobs = max(0, self._active_jobs - 1)
+            async with self._state_changed:
+                replica.active_jobs = max(0, replica.active_jobs - 1)
+                self._state_changed.notify_all()
