@@ -152,6 +152,10 @@
       flex-wrap: wrap;
     }
 
+    .control-hidden {
+      display: none !important;
+    }
+
     select, .slider-group {
       padding: 8px 10px;
       background: #0d0d1a;
@@ -398,7 +402,9 @@
       <div class="card-title">Synthesis</div>
       <textarea id="text-input" placeholder="Enter text to synthesize..."></textarea>
       <div class="controls-row">
-        <select id="model-select"></select>
+        <div id="model-select-wrap">
+          <select id="model-select"></select>
+        </div>
         <select id="language-select">
           <option value="English">English</option>
           <option value="Chinese">Chinese</option>

@@ -49,6 +49,7 @@ class AmeegoTTSClient {
     this.statusText = document.getElementById('status-text');
     this.connectBtn = document.getElementById('connect-btn');
     this.textInput = document.getElementById('text-input');
+    this.modelSelectWrap = document.getElementById('model-select-wrap');
     this.modelSelect = document.getElementById('model-select');
     this.languageSelect = document.getElementById('language-select');
     this.chunkSizeSlider = document.getElementById('chunk-size');
@@ -145,8 +146,8 @@ class AmeegoTTSClient {
     this.lastHealth = data;
 
     const modelLabels = {
-      '0.6B': 'Standard (0.6B)',
-      '1.7B': 'High Quality (1.7B)',
+      '0.6B': 'Standard',
+      '1.7B': 'Quality',
     };
     const models = data.available_clone_models || data.available_models || [];
     const defaultModel = data.default_clone_model_size || data.default_model || models[0];
@@ -375,6 +376,9 @@ class AmeegoTTSClient {
     const mode = this.selectedVoiceMode();
     this.clonePanel.style.display = mode === 'clone' ? 'block' : 'none';
     this.voiceDesignPanel.style.display = mode === 'design' ? 'block' : 'none';
+    const hasCloneModelChoice = this.modelSelect.options.length > 1;
+    const showModelSelect = mode !== 'design' && hasCloneModelChoice;
+    this.modelSelectWrap.classList.toggle('control-hidden', !showModelSelect);
   }
 
   updateControls() {
