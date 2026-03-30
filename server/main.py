@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from server.config import settings
-from server.tts_engine import TTSEngineRegistry
+from server.models import ModeSwitchRequest
+from server.tts_engine import RuntimeStateError, TTSRuntime
 from server.ws_handler import handle_websocket
 
 logging.basicConfig(
@@ -16,21 +18,30 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting Ameego TTS server...")
-    logger.info("Models: %s (default: %s)", settings.model_sizes, settings.default_model_size)
+    logger.info(
+        "Base models: %s, initial clone model: %s, initial mode: %s, voice design enabled: %s",
+        settings.model_sizes,
+        settings.initial_clone_model_size,
+        settings.initial_mode,
+        settings.voice_design_enabled,
+    )
 
-    registry = TTSEngineRegistry.from_config(settings)
-    registry.warm_up_all()
-    app.state.engine_registry = registry
+    runtime = TTSRuntime(settings)
+    await runtime.initialize()
+    app.state.runtime = runtime
     app.state.active_connections = 0
 
     logger.info(
-        "Server ready. Models: %s, Max connections: %d",
-        registry.available_models, settings.max_connections,
+        "Server ready. Mode: %s, Active model: %s, Max connections: %d",
+        runtime.active_mode,
+        runtime.active_model_id,
+        settings.max_connections,
     )
     yield
 
@@ -42,40 +53,51 @@ app = FastAPI(title="Ameego TTS", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    registry: TTSEngineRegistry = app.state.engine_registry
-    models = {}
-    for size, engine in registry.items():
-        models[size] = {
-            "model_id": engine.model.model_name if hasattr(engine.model, 'model_name') else f"Qwen3-TTS-{size}",
-            "sample_rate": engine.sample_rate,
+    runtime: TTSRuntime = app.state.runtime
+    payload = runtime.health_payload()
+    payload.update(
+        {
+            "max_connections": settings.max_connections,
+            "active_connections": app.state.active_connections,
         }
-    return JSONResponse({
-        "status": "ok",
-        "available_models": registry.available_models,
-        "default_model": registry.default_model,
-        "models": models,
-        "max_connections": settings.max_connections,
-        "active_connections": app.state.active_connections,
-    })
+    )
+    return JSONResponse(payload)
+
+
+@app.post("/mode/switch")
+async def switch_mode(req: ModeSwitchRequest):
+    runtime: TTSRuntime = app.state.runtime
+    try:
+        result = await runtime.start_mode_switch(
+            target_mode=req.mode,
+            clone_model_size=req.model,
+        )
+        return JSONResponse(result)
+    except RuntimeStateError as e:
+        return JSONResponse(
+            {
+                "status": "error",
+                "code": e.code,
+                "message": e.message,
+            }
+        )
 
 
 @app.websocket("/ws/tts")
 async def websocket_tts(ws: WebSocket):
-    registry: TTSEngineRegistry = app.state.engine_registry
+    runtime: TTSRuntime = app.state.runtime
 
     await ws.accept()
 
-    # Reject if at capacity (asyncio is single-threaded, no race)
     if app.state.active_connections >= settings.max_connections:
         await ws.close(code=1013, reason="Server at max capacity")
         return
 
     app.state.active_connections += 1
     try:
-        await handle_websocket(ws, registry)
+        await handle_websocket(ws, runtime)
     finally:
         app.state.active_connections -= 1
 
 
-# Mount static web app last (catch-all)
-app.mount("/", StaticFiles(directory="web", html=True), name="web")
+app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")

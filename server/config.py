@@ -19,6 +19,10 @@ SUPPORTED_LANGUAGES = frozenset({
 class Settings(BaseSettings):
     model_sizes: str = "0.6B,1.7B"
     default_model_size: str = "0.6B"
+    initial_mode: Literal["voice_clone", "voice_design"] = "voice_clone"
+    initial_clone_model_size: str = "0.6B"
+    voice_design_enabled: bool = False
+    voice_design_model_id: str = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
     model_id_0_6b: str = MODEL_ID_MAP["0.6B"]
     model_id_1_7b: str = MODEL_ID_MAP["1.7B"]
     model_device: str = "cuda"
@@ -37,6 +41,13 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"DEFAULT_MODEL_SIZE={self.default_model_size!r} must be one of MODEL_SIZES={sizes}"
             )
+        if self.initial_clone_model_size not in sizes:
+            raise ValueError(
+                "INITIAL_CLONE_MODEL_SIZE="
+                f"{self.initial_clone_model_size!r} must be one of MODEL_SIZES={sizes}"
+            )
+        if self.initial_mode == "voice_design" and not self.voice_design_enabled:
+            raise ValueError("INITIAL_MODE='voice_design' requires VOICE_DESIGN_ENABLED=true")
         return self
 
     @property

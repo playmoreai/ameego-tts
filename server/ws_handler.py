@@ -22,11 +22,10 @@ from server.models import (
     UploadRefAudioRequest,
     VoiceClonePromptReady,
 )
-from server.tts_engine import TTSEngineRegistry
+from server.tts_engine import RuntimeStateError, TTSRuntime
 
 logger = logging.getLogger(__name__)
 
-# Binary frame header: magic(4) + request_id_hash(4) + chunk_index(4) + sample_rate(4)
 HEADER_MAGIC = b"AMEG"
 HEADER_SIZE = 16
 
@@ -42,7 +41,6 @@ async def _send_error(
     message: str,
     request_id: str | None = None,
 ) -> None:
-    """Send an error message to the client."""
     await ws.send_json(
         ErrorMessage(request_id=request_id, code=code, message=message).model_dump()
     )
@@ -52,7 +50,6 @@ async def _cancel_task(
     cancel_event: threading.Event | None,
     synthesis_task: asyncio.Task | None,
 ) -> None:
-    """Cancel active synthesis cleanly."""
     if cancel_event:
         cancel_event.set()
     if synthesis_task and not synthesis_task.done():
@@ -65,7 +62,7 @@ async def _cancel_task(
             logger.warning("Synthesis task error during cancel", exc_info=True)
 
 
-async def handle_websocket(ws: WebSocket, registry: TTSEngineRegistry) -> None:
+async def handle_websocket(ws: WebSocket, runtime: TTSRuntime) -> None:
     logger.info("WebSocket connected: %s", ws.client)
 
     cancel_event: threading.Event | None = None
@@ -89,11 +86,11 @@ async def handle_websocket(ws: WebSocket, registry: TTSEngineRegistry) -> None:
                 await _cancel_task(cancel_event, synthesis_task)
                 cancel_event = threading.Event()
                 synthesis_task = asyncio.create_task(
-                    _handle_synthesize(ws, registry, raw, cancel_event)
+                    _handle_synthesize(ws, runtime, raw, cancel_event)
                 )
 
             elif msg_type == "upload_ref_audio":
-                await _handle_upload_ref_audio(ws, registry, raw)
+                await _handle_upload_ref_audio(ws, runtime, raw)
 
             else:
                 await _send_error(ws, "UNKNOWN_TYPE", f"Unknown message type: {msg_type}")
@@ -112,7 +109,7 @@ async def handle_websocket(ws: WebSocket, registry: TTSEngineRegistry) -> None:
 
 async def _handle_synthesize(
     ws: WebSocket,
-    registry: TTSEngineRegistry,
+    runtime: TTSRuntime,
     raw: dict,
     cancel_event: threading.Event,
 ) -> None:
@@ -122,21 +119,14 @@ async def _handle_synthesize(
         await _send_error(ws, "INVALID_REQUEST", str(e))
         return
 
-    # Resolve model
-    try:
-        engine = registry.get(req.model)
-    except ValueError as e:
-        await _send_error(ws, "INVALID_MODEL", str(e), req.request_id)
-        return
-
-    # Validate text
     if not req.text or not req.text.strip():
         await _send_error(ws, "INVALID_TEXT", "Text cannot be empty.", req.request_id)
         return
 
     if len(req.text) > settings.max_text_length:
         await _send_error(
-            ws, "INVALID_TEXT",
+            ws,
+            "INVALID_TEXT",
             f"Text exceeds maximum length of {settings.max_text_length} characters.",
             req.request_id,
         )
@@ -144,115 +134,144 @@ async def _handle_synthesize(
 
     if req.language not in SUPPORTED_LANGUAGES:
         await _send_error(
-            ws, "INVALID_LANGUAGE",
+            ws,
+            "INVALID_LANGUAGE",
             f"Unsupported language: {req.language}. Supported: {sorted(SUPPORTED_LANGUAGES)}",
             req.request_id,
         )
         return
 
-    # Resolve voice clone prompt
+    if req.mode == "voice_design":
+        if req.voice_clone_prompt_id:
+            await _send_error(
+                ws,
+                "INVALID_REQUEST",
+                "voice_clone_prompt_id is not allowed in voice design mode.",
+                req.request_id,
+            )
+            return
+        if not req.instruct or not req.instruct.strip():
+            await _send_error(
+                ws,
+                "INVALID_INSTRUCT",
+                "Voice Design requires a non-empty instruction.",
+                req.request_id,
+            )
+            return
+
     ref_audio_path = None
     voice_clone_prompt = None
-    if req.voice_clone_prompt_id:
-        voice_clone_prompt = engine.get_voice_prompt(req.voice_clone_prompt_id)
-        if voice_clone_prompt is None:
-            # Prompt cache miss — fall back to ref audio (slower, recomputes embedding)
-            path = engine.get_ref_audio_path(req.voice_clone_prompt_id)
-            if path is None:
-                await _send_error(
-                    ws, "PROMPT_NOT_FOUND",
-                    f"Voice clone prompt not found: {req.voice_clone_prompt_id}",
-                    req.request_id,
-                )
-                return
-            ref_audio_path = str(path)
-
-    # Send synthesis_start
-    await ws.send_json(
-        SynthesisStart(
-            request_id=req.request_id,
-            model=engine.model_size,
-            sample_rate=engine.sample_rate,
-        ).model_dump()
-    )
-
-    # Stream audio
-    t_start = time.perf_counter()
-    t_first_chunk = None
-    chunk_index = 0
-    total_bytes = 0
-    cancelled = False
 
     try:
-        async for pcm_chunk in engine.stream_tts(
-            text=req.text,
-            language=req.language,
-            chunk_size=req.chunk_size,
-            ref_audio_path=ref_audio_path,
-            voice_clone_prompt=voice_clone_prompt,
-            cancel_event=cancel_event,
-        ):
-            if cancel_event.is_set():
-                cancelled = True
-                break
+        async with runtime.acquire_request_engine(
+            mode=req.mode,
+            clone_model_size=req.model,
+        ) as engine:
+            if req.mode == "voice_clone" and req.voice_clone_prompt_id:
+                voice_clone_prompt = engine.get_voice_prompt(req.voice_clone_prompt_id)
+                if voice_clone_prompt is None:
+                    path = engine.get_ref_audio_path(req.voice_clone_prompt_id)
+                    if path is None:
+                        await _send_error(
+                            ws,
+                            "PROMPT_NOT_FOUND",
+                            f"Voice clone prompt not found: {req.voice_clone_prompt_id}",
+                            req.request_id,
+                        )
+                        return
+                    ref_audio_path = str(path)
 
-            if t_first_chunk is None:
-                t_first_chunk = time.perf_counter()
-
-            header = _make_header(req.request_id, chunk_index, engine.sample_rate)
-            await ws.send_bytes(header + pcm_chunk)
-            total_bytes += len(pcm_chunk)
-            chunk_index += 1
-
-    except Exception as e:
-        logger.error("Synthesis streaming error: %s", e, exc_info=True)
-        try:
-            await _send_error(ws, "SYNTHESIS_ERROR", str(e), req.request_id)
-        except Exception:
-            pass
-        return
-
-    # Send appropriate end message
-    if cancelled:
-        logger.info("Synthesis cancelled: %d chunks sent", chunk_index)
-        try:
             await ws.send_json(
-                SynthesisCancelled(
+                SynthesisStart(
                     request_id=req.request_id,
-                    chunks_sent=chunk_index,
+                    mode=req.mode,
+                    model=engine.display_name,
+                    sample_rate=engine.sample_rate,
                 ).model_dump()
             )
-        except Exception:
-            pass
-    else:
-        t_end = time.perf_counter()
-        total_samples = total_bytes // 2
-        duration_ms = (total_samples / engine.sample_rate) * 1000 if engine.sample_rate else 0
-        wall_time_ms = (t_end - t_start) * 1000
-        ttfa_ms = (t_first_chunk - t_start) * 1000 if t_first_chunk else 0
-        rtf = (wall_time_ms / duration_ms) if duration_ms > 0 else 0
 
-        await ws.send_json(
-            SynthesisEnd(
-                request_id=req.request_id,
-                model=engine.model_size,
-                total_chunks=chunk_index,
-                total_samples=total_samples,
-                duration_ms=duration_ms,
-                ttfa_ms=round(ttfa_ms, 1),
-                rtf=round(rtf, 3),
-            ).model_dump()
-        )
+            t_start = time.perf_counter()
+            t_first_chunk = None
+            chunk_index = 0
+            total_bytes = 0
+            cancelled = False
 
-        logger.info(
-            "[%s] Synthesis complete: %d chunks, %.0fms audio, TTFA=%.0fms, RTF=%.3f",
-            engine.model_size, chunk_index, duration_ms, ttfa_ms, rtf,
-        )
+            try:
+                async for pcm_chunk in engine.stream_tts(
+                    mode=req.mode,
+                    text=req.text,
+                    language=req.language,
+                    chunk_size=req.chunk_size,
+                    ref_audio_path=ref_audio_path,
+                    voice_clone_prompt=voice_clone_prompt,
+                    instruct=req.instruct.strip() if req.instruct else None,
+                    cancel_event=cancel_event,
+                ):
+                    if cancel_event.is_set():
+                        cancelled = True
+                        break
+
+                    if t_first_chunk is None:
+                        t_first_chunk = time.perf_counter()
+
+                    header = _make_header(req.request_id, chunk_index, engine.sample_rate)
+                    await ws.send_bytes(header + pcm_chunk)
+                    total_bytes += len(pcm_chunk)
+                    chunk_index += 1
+
+            except Exception as e:
+                logger.error("Synthesis streaming error: %s", e, exc_info=True)
+                await _send_error(ws, "SYNTHESIS_ERROR", str(e), req.request_id)
+                return
+
+            if cancelled:
+                logger.info("Synthesis cancelled: %d chunks sent", chunk_index)
+                try:
+                    await ws.send_json(
+                        SynthesisCancelled(
+                            request_id=req.request_id,
+                            chunks_sent=chunk_index,
+                        ).model_dump()
+                    )
+                except Exception:
+                    pass
+                return
+
+            t_end = time.perf_counter()
+            total_samples = total_bytes // 2
+            duration_ms = (total_samples / engine.sample_rate) * 1000 if engine.sample_rate else 0
+            wall_time_ms = (t_end - t_start) * 1000
+            ttfa_ms = (t_first_chunk - t_start) * 1000 if t_first_chunk else 0
+            rtf = (wall_time_ms / duration_ms) if duration_ms > 0 else 0
+
+            await ws.send_json(
+                SynthesisEnd(
+                    request_id=req.request_id,
+                    mode=req.mode,
+                    model=engine.display_name,
+                    total_chunks=chunk_index,
+                    total_samples=total_samples,
+                    duration_ms=duration_ms,
+                    ttfa_ms=round(ttfa_ms, 1),
+                    rtf=round(rtf, 3),
+                ).model_dump()
+            )
+
+            logger.info(
+                "[%s] Synthesis complete: %d chunks, %.0fms audio, TTFA=%.0fms, RTF=%.3f",
+                engine.display_name,
+                chunk_index,
+                duration_ms,
+                ttfa_ms,
+                rtf,
+            )
+    except RuntimeStateError as e:
+        await _send_error(ws, e.code, e.message, req.request_id)
 
 
 async def _handle_upload_ref_audio(
     ws: WebSocket,
-    registry: TTSEngineRegistry,
+    runtime: TTSRuntime,
     raw: dict,
 ) -> None:
     try:
@@ -261,18 +280,11 @@ async def _handle_upload_ref_audio(
         await _send_error(ws, "INVALID_REQUEST", str(e))
         return
 
-    # Resolve model
-    try:
-        engine = registry.get(req.model)
-    except ValueError as e:
-        await _send_error(ws, "INVALID_MODEL", str(e), req.request_id)
-        return
-
-    # Validate audio format
     fmt = req.audio_format.lower().strip()
     if fmt not in ALLOWED_AUDIO_FORMATS:
         await _send_error(
-            ws, "INVALID_AUDIO",
+            ws,
+            "INVALID_AUDIO",
             f"Unsupported audio format: {req.audio_format}. Supported: {sorted(ALLOWED_AUDIO_FORMATS)}",
             req.request_id,
         )
@@ -283,13 +295,17 @@ async def _handle_upload_ref_audio(
         audio_bytes = base64.b64decode(audio_base64, validate=True)
     except Exception:
         await _send_error(
-            ws, "INVALID_AUDIO", "Invalid base64-encoded audio data.", req.request_id,
+            ws,
+            "INVALID_AUDIO",
+            "Invalid base64-encoded audio data.",
+            req.request_id,
         )
         return
 
     if len(audio_bytes) < 1000:
         await _send_error(
-            ws, "INVALID_AUDIO",
+            ws,
+            "INVALID_AUDIO",
             "Reference audio is too short. Please provide at least 3 seconds.",
             req.request_id,
         )
@@ -297,44 +313,50 @@ async def _handle_upload_ref_audio(
 
     if len(audio_bytes) > 10 * 1024 * 1024:
         await _send_error(
-            ws, "INVALID_AUDIO", "Reference audio exceeds 10MB limit.", req.request_id,
-        )
-        return
-
-    # Save and convert to WAV
-    t0 = time.perf_counter()
-    try:
-        prompt_id, _ = engine.save_ref_audio(audio_bytes, fmt)
-    except ValueError as e:
-        await _send_error(ws, "INVALID_AUDIO", str(e), req.request_id)
-        return
-
-    # Pre-compute speaker embedding on GPU
-    try:
-        precompute_ms = await engine.run_on_gpu(
-            engine.precompute_voice_prompt, prompt_id,
-        )
-    except Exception as e:
-        logger.error("Failed to precompute voice prompt: %s", e, exc_info=True)
-        await _send_error(
-            ws, "VOICE_CLONE_ERROR",
-            f"Failed to process reference audio: {e}",
+            ws,
+            "INVALID_AUDIO",
+            "Reference audio exceeds 10MB limit.",
             req.request_id,
         )
         return
 
-    elapsed = (time.perf_counter() - t0) * 1000
+    t0 = time.perf_counter()
 
-    await ws.send_json(
-        VoiceClonePromptReady(
-            request_id=req.request_id,
-            model=engine.model_size,
-            prompt_id=prompt_id,
-            processing_ms=round(elapsed, 1),
-        ).model_dump()
-    )
+    try:
+        async with runtime.acquire_request_engine(
+            mode="voice_clone",
+            clone_model_size=req.model,
+        ) as engine:
+            prompt_id, _ = engine.save_ref_audio(audio_bytes, fmt)
+            precompute_ms = await engine.run_on_gpu(engine.precompute_voice_prompt, prompt_id)
+            elapsed = (time.perf_counter() - t0) * 1000
 
-    logger.info(
-        "Voice clone prompt ready: %s (model=%s, %.0fms, precompute=%.0fms)",
-        prompt_id, engine.model_size, elapsed, precompute_ms,
-    )
+            await ws.send_json(
+                VoiceClonePromptReady(
+                    request_id=req.request_id,
+                    model=engine.display_name,
+                    prompt_id=prompt_id,
+                    processing_ms=round(elapsed, 1),
+                    runtime_generation=runtime.runtime_generation,
+                ).model_dump()
+            )
+
+            logger.info(
+                "Voice clone prompt ready: %s (model=%s, %.0fms, precompute=%.0fms)",
+                prompt_id,
+                engine.display_name,
+                elapsed,
+                precompute_ms,
+            )
+    except RuntimeStateError as e:
+        await _send_error(ws, e.code, e.message, req.request_id)
+    except ValueError as e:
+        await _send_error(ws, "INVALID_AUDIO", str(e), req.request_id)
+    except Exception as e:
+        logger.error("Failed to precompute voice prompt: %s", e, exc_info=True)
+        await _send_error(
+            ws,
+            "VOICE_CLONE_ERROR",
+            f"Failed to process reference audio: {e}",
+            req.request_id,
+        )

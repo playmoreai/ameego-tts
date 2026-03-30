@@ -4,6 +4,7 @@ Real-time streaming TTS server powered by [Qwen3-TTS](https://github.com/QwenLM/
 
 - **Low-latency streaming** with ~150ms TTFA on the tested L4 setup
 - **Voice cloning** with 3 seconds of reference audio
+- **Voice Design** as an optional deploy-time feature with runtime mode switching
 - **10 languages** — English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
 - **One-command** deploy and destroy
 - **Web UI** for instant testing
@@ -45,7 +46,7 @@ Real-time streaming TTS server powered by [Qwen3-TTS](https://github.com/QwenLM/
 ./deploy.sh up --zone us-west2-b
 ```
 
-The script builds via Cloud Build, creates a GCE VM with GPU, and waits for health check. By default it preserves the original behavior of building and loading both logical model sizes, while `--model` only changes the default selection. If you want a smaller single-model deployment, set `MODEL_SIZES=0.6B` or `MODEL_SIZES=1.7B` in the shell before running `./deploy.sh up`. When ready, it prints the server URL.
+The script builds via Cloud Build, creates a GCE VM with GPU, and waits for health check. By default it preserves the original behavior of building and loading both logical model sizes. `--model` changes both the default selection and the initial active clone model. If you want a smaller single-model deployment, set `MODEL_SIZES=0.6B` or `MODEL_SIZES=1.7B` in the shell before running `./deploy.sh up`. When ready, it prints the server URL.
 
 ### Manage
 
@@ -78,6 +79,8 @@ The script builds via Cloud Build, creates a GCE VM with GPU, and waits for heal
 |---|---|---|
 | `MODEL_SIZES` | `0.6B,1.7B` | Comma-separated model sizes to load |
 | `DEFAULT_MODEL_SIZE` | `0.6B` | Default model when client doesn't specify |
+| `INITIAL_MODE` | `voice_clone` | Runtime mode loaded at startup |
+| `INITIAL_CLONE_MODEL_SIZE` | `0.6B` | Base model size loaded for `voice_clone` mode. In `deploy.sh`, this defaults to `DEFAULT_MODEL_SIZE` if unset |
 | `CHUNK_SIZE` | `2` | Streaming chunk size (codec steps per audio chunk, 1=~83ms, 2=~167ms) |
 | `MAX_CONNECTIONS` | `4` | Max concurrent WebSocket connections |
 | `MAX_TEXT_LENGTH` | `5000` | Max input text length (characters) |
@@ -89,6 +92,8 @@ Additional model-loading env vars:
 |---|---|---|
 | `MODEL_ID_0_6B` | `Qwen/Qwen3-TTS-12Hz-0.6B-Base` | Hugging Face repo used for logical `0.6B` |
 | `MODEL_ID_1_7B` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Hugging Face repo used for logical `1.7B` |
+| `VOICE_DESIGN_ENABLED` | `false` | Enable the optional Voice Design model |
+| `VOICE_DESIGN_MODEL_ID` | `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` | Hugging Face repo used for Voice Design |
 | `MODEL_DEVICE` | `cuda` | CUDA device passed into model load |
 | `MODEL_DTYPE` | `bfloat16` | Activation dtype passed into model load |
 | `ATTN_IMPLEMENTATION` | `sdpa` | Attention backend used during model load |
@@ -97,6 +102,7 @@ Additional model-loading env vars:
 Notes:
 - The server now vendors `faster-qwen3-tts` under [vendor/faster-qwen3-tts](/Users/jin/Workspace/ameego-tts/vendor/faster-qwen3-tts).
 - `./deploy.sh up` picks up these env vars from the current shell, so you can deploy a custom Hugging Face repo without editing the script.
+- Enable Voice Design explicitly when needed, for example: `VOICE_DESIGN_ENABLED=true ./deploy.sh up`
 - Quantization was evaluated separately and intentionally not carried into production. See [docs/quantization-evaluation-2026-03-30.md](/Users/jin/Workspace/ameego-tts/docs/quantization-evaluation-2026-03-30.md).
 
 ### Model Comparison
@@ -122,10 +128,38 @@ Connect to `ws://<server-ip>:8080/ws/tts`.
   "type": "synthesize",
   "request_id": "uuid",
   "text": "Hello, world!",
+  "mode": "voice_clone",
   "language": "English",
   "model": "0.6B",
+  "instruct": null,
   "voice_clone_prompt_id": null,
   "chunk_size": 2
+}
+```
+
+**Voice Design synthesize:**
+```json
+{
+  "type": "synthesize",
+  "request_id": "uuid",
+  "text": "Welcome to the show.",
+  "mode": "voice_design",
+  "language": "English",
+  "instruct": "Warm, confident narrator with a calm broadcast tone",
+  "model": null,
+  "voice_clone_prompt_id": null,
+  "chunk_size": 2
+}
+```
+
+**Switch mode:**
+```http
+POST /mode/switch
+Content-Type: application/json
+
+{
+  "mode": "voice_design",
+  "model": null
 }
 ```
 

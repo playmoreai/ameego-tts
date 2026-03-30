@@ -25,12 +25,16 @@ FROM builder AS model-downloader
 ARG MODEL_SIZES=0.6B,1.7B
 ARG MODEL_ID_0_6B=Qwen/Qwen3-TTS-12Hz-0.6B-Base
 ARG MODEL_ID_1_7B=Qwen/Qwen3-TTS-12Hz-1.7B-Base
+ARG VOICE_DESIGN_ENABLED=false
+ARG VOICE_DESIGN_MODEL_ID=Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign
 
 COPY scripts/download_models.py /tmp/download_models.py
 RUN python3 /tmp/download_models.py \
     --model-sizes ${MODEL_SIZES} \
     --model-id-0-6b ${MODEL_ID_0_6B} \
     --model-id-1-7b ${MODEL_ID_1_7B} \
+    $(if [ "${VOICE_DESIGN_ENABLED}" = "true" ]; then echo --voice-design-enabled; fi) \
+    --voice-design-model-id ${VOICE_DESIGN_MODEL_ID} \
     --cache-dir /models
 
 # Stage 3: Runtime

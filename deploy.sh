@@ -22,6 +22,8 @@ DEFAULT_MODEL="0.6B"
 DEFAULT_MODEL_SIZES="0.6B,1.7B"
 DEFAULT_MODEL_ID_0_6B="Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 DEFAULT_MODEL_ID_1_7B="Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+DEFAULT_VOICE_DESIGN_ENABLED="false"
+DEFAULT_VOICE_DESIGN_MODEL_ID="Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 MACHINE_TYPE="g2-standard-4"
 BOOT_DISK_SIZE="100GB"
 IMAGE_FAMILY="common-cu128-ubuntu-2204-nvidia-570"
@@ -53,6 +55,8 @@ save_deploy_env() {
 ZONE=${ZONE}
 MODEL_SIZES=${MODEL_SIZES}
 DEFAULT_MODEL_SIZE=${DEFAULT_MODEL_SIZE}
+INITIAL_CLONE_MODEL_SIZE=${INITIAL_CLONE_MODEL_SIZE}
+VOICE_DESIGN_ENABLED=${VOICE_DESIGN_ENABLED:-false}
 PROJECT_ID=${PROJECT_ID}
 INSTANCE_NAME=${INSTANCE_NAME}
 SERVER_PORT=${SERVER_PORT}
@@ -118,6 +122,17 @@ validate_model_id() {
     esac
 }
 
+normalize_bool() {
+    case "${1:-}" in
+        1|true|TRUE|yes|YES|on|ON) echo "true" ;;
+        0|false|FALSE|no|NO|off|OFF|"") echo "false" ;;
+        *)
+            err "Invalid boolean value: $1"
+            exit 1
+            ;;
+    esac
+}
+
 check_prerequisites() {
     if ! command -v gcloud &>/dev/null; then
         err "gcloud CLI not found. Install: https://cloud.google.com/sdk/docs/install"
@@ -139,6 +154,8 @@ cmd_up() {
     local MODEL_SIZE="$DEFAULT_MODEL"
     local ZONE="$DEFAULT_ZONE"
     local SPOT_FLAG=""
+    local SKIP_BUILD_FLAG
+    SKIP_BUILD_FLAG="$(normalize_bool "${SKIP_BUILD:-false}")"
 
     # Parse args
     while [[ $# -gt 0 ]]; do
@@ -157,13 +174,18 @@ cmd_up() {
     local REGISTRY="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}"
     local MODEL_SIZES_TO_LOAD="${MODEL_SIZES:-$DEFAULT_MODEL_SIZES}"
     local DEFAULT_MODEL_SIZE_TO_USE="${DEFAULT_MODEL_SIZE:-$MODEL_SIZE}"
+    local INITIAL_CLONE_MODEL_SIZE_TO_USE="${INITIAL_CLONE_MODEL_SIZE:-$DEFAULT_MODEL_SIZE_TO_USE}"
     local MODEL_ID_0_6B_TO_USE="${MODEL_ID_0_6B:-$DEFAULT_MODEL_ID_0_6B}"
     local MODEL_ID_1_7B_TO_USE="${MODEL_ID_1_7B:-$DEFAULT_MODEL_ID_1_7B}"
+    local VOICE_DESIGN_ENABLED_TO_USE
+    VOICE_DESIGN_ENABLED_TO_USE="$(normalize_bool "${VOICE_DESIGN_ENABLED:-$DEFAULT_VOICE_DESIGN_ENABLED}")"
+    local VOICE_DESIGN_MODEL_ID_TO_USE="${VOICE_DESIGN_MODEL_ID:-$DEFAULT_VOICE_DESIGN_MODEL_ID}"
     local IMAGE_TAG="${REGISTRY}/ameego-tts:${DEFAULT_MODEL_SIZE_TO_USE}"
 
     validate_model_sizes "$MODEL_SIZES_TO_LOAD"
     validate_model_id "MODEL_ID_0_6B" "$MODEL_ID_0_6B_TO_USE"
     validate_model_id "MODEL_ID_1_7B" "$MODEL_ID_1_7B_TO_USE"
+    validate_model_id "VOICE_DESIGN_MODEL_ID" "$VOICE_DESIGN_MODEL_ID_TO_USE"
 
     case ",${MODEL_SIZES_TO_LOAD}," in
         *",${DEFAULT_MODEL_SIZE_TO_USE},"*) ;;
@@ -172,17 +194,31 @@ cmd_up() {
             exit 1
             ;;
     esac
+    case ",${MODEL_SIZES_TO_LOAD}," in
+        *",${INITIAL_CLONE_MODEL_SIZE_TO_USE},"*) ;;
+        *)
+            err "INITIAL_CLONE_MODEL_SIZE=${INITIAL_CLONE_MODEL_SIZE_TO_USE} must be included in MODEL_SIZES=${MODEL_SIZES_TO_LOAD}"
+            exit 1
+            ;;
+    esac
 
     MODEL_SIZES="${MODEL_SIZES_TO_LOAD}"
     DEFAULT_MODEL_SIZE="${DEFAULT_MODEL_SIZE_TO_USE}"
+    INITIAL_CLONE_MODEL_SIZE="${INITIAL_CLONE_MODEL_SIZE_TO_USE}"
     MODEL_ID_0_6B="${MODEL_ID_0_6B_TO_USE}"
     MODEL_ID_1_7B="${MODEL_ID_1_7B_TO_USE}"
+    VOICE_DESIGN_ENABLED="${VOICE_DESIGN_ENABLED_TO_USE}"
+    VOICE_DESIGN_MODEL_ID="${VOICE_DESIGN_MODEL_ID_TO_USE}"
 
     local DOCKER_ENV_ARGS
     DOCKER_ENV_ARGS="$(
         build_docker_env_args \
             MODEL_SIZES \
             DEFAULT_MODEL_SIZE \
+            INITIAL_MODE \
+            INITIAL_CLONE_MODEL_SIZE \
+            VOICE_DESIGN_ENABLED \
+            VOICE_DESIGN_MODEL_ID \
             SERVER_PORT \
             MODEL_ID_0_6B \
             MODEL_ID_1_7B \
@@ -202,7 +238,9 @@ cmd_up() {
     echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
     echo ""
     echo "  Default:  Qwen3-TTS-${DEFAULT_MODEL_SIZE_TO_USE}"
+    echo "  Initial:  Qwen3-TTS-${INITIAL_CLONE_MODEL_SIZE_TO_USE}"
     echo "  Load:     ${MODEL_SIZES_TO_LOAD}"
+    echo "  Voice Design: ${VOICE_DESIGN_ENABLED_TO_USE}"
     echo "  Machine:  ${MACHINE_TYPE}"
     echo "  Zone:     ${ZONE}"
     echo "  Spot:     ${SPOT_FLAG:-no}"
@@ -216,13 +254,17 @@ cmd_up() {
         --quiet 2>/dev/null || true
 
     # 2. Build and push Docker image via Cloud Build
-    log "Building Docker image via Cloud Build (this may take 15-30 minutes)..."
-    gcloud builds submit "$SCRIPT_DIR" \
-        --config="${SCRIPT_DIR}/cloudbuild.yaml" \
-        --substitutions="_MODEL_SIZES=${MODEL_SIZES_TO_LOAD//,/%2C},_MODEL_ID_0_6B=${MODEL_ID_0_6B_TO_USE},_MODEL_ID_1_7B=${MODEL_ID_1_7B_TO_USE},_IMAGE_TAG=${IMAGE_TAG}" \
-        --quiet
+    if [ "$SKIP_BUILD_FLAG" = "true" ]; then
+        log "Skipping image build and reusing: ${IMAGE_TAG}"
+    else
+        log "Building Docker image via Cloud Build (this may take 15-30 minutes)..."
+        gcloud builds submit "$SCRIPT_DIR" \
+            --config="${SCRIPT_DIR}/cloudbuild.yaml" \
+            --substitutions="_MODEL_SIZES=${MODEL_SIZES_TO_LOAD//,/%2C},_MODEL_ID_0_6B=${MODEL_ID_0_6B_TO_USE},_MODEL_ID_1_7B=${MODEL_ID_1_7B_TO_USE},_VOICE_DESIGN_ENABLED=${VOICE_DESIGN_ENABLED_TO_USE},_VOICE_DESIGN_MODEL_ID=${VOICE_DESIGN_MODEL_ID_TO_USE},_IMAGE_TAG=${IMAGE_TAG}" \
+            --quiet
 
-    log "Image pushed: ${IMAGE_TAG}"
+        log "Image pushed: ${IMAGE_TAG}"
+    fi
 
     # 3. Create firewall rule
     log "Ensuring firewall rule..."
@@ -295,6 +337,10 @@ docker run -d \
 echo 'Ameego TTS container started'
 "
 
+    local STARTUP_SCRIPT_FILE
+    STARTUP_SCRIPT_FILE="$(mktemp)"
+    printf '%s\n' "$STARTUP_SCRIPT" > "$STARTUP_SCRIPT_FILE"
+
     gcloud compute instances create "$INSTANCE_NAME" \
         --zone="$ZONE" \
         --machine-type="$MACHINE_TYPE" \
@@ -305,9 +351,11 @@ echo 'Ameego TTS container started'
         --tags="$INSTANCE_NAME" \
         --scopes=cloud-platform \
         --maintenance-policy=TERMINATE \
-        --metadata="startup-script=${STARTUP_SCRIPT}" \
+        --metadata-from-file="startup-script=${STARTUP_SCRIPT_FILE}" \
         $SPOT_FLAG \
         --quiet
+
+    rm -f "$STARTUP_SCRIPT_FILE"
 
     # Save state
     save_deploy_env
