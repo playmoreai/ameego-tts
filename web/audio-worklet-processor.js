@@ -4,8 +4,10 @@ class PCMPlayerProcessor extends AudioWorkletProcessor {
     this.buffer = new Float32Array(0);
     this.port.onmessage = (e) => {
       if (e.data.type === 'audio') {
-        // Convert Int16 PCM to Float32 and append to ring buffer
-        const int16 = new Int16Array(e.data.samples.buffer);
+        // Preserve the original PCM view so chunk headers or buffer padding are never re-read.
+        const int16 = e.data.samples instanceof Int16Array
+          ? e.data.samples
+          : new Int16Array(e.data.samples);
         const float32 = new Float32Array(int16.length);
         for (let i = 0; i < int16.length; i++) {
           float32[i] = int16[i] / 32768.0;
