@@ -22,6 +22,7 @@ class AmeegoTTSClient {
     this.pcmBuffer = []; // ring buffer for ScriptProcessor fallback
     this.isConnected = false;
     this.voiceClonePromptId = null;
+    this.voiceClonePromptModel = null;
     this.reconnectDelay = 1000;
     this.maxReconnectDelay = 30000;
     this.currentRequestId = null;
@@ -33,6 +34,7 @@ class AmeegoTTSClient {
     this.statusText = document.getElementById('status-text');
     this.connectBtn = document.getElementById('connect-btn');
     this.textInput = document.getElementById('text-input');
+    this.modelSelect = document.getElementById('model-select');
     this.languageSelect = document.getElementById('language-select');
     this.chunkSizeSlider = document.getElementById('chunk-size');
     this.chunkSizeValue = document.getElementById('chunk-size-value');
@@ -55,6 +57,7 @@ class AmeegoTTSClient {
     this.metricDuration = document.getElementById('metric-duration');
     this.metricChunks = document.getElementById('metric-chunks');
     this.metricBuffer = document.getElementById('metric-buffer');
+    this.metricModel = document.getElementById('metric-model');
 
     this.bindEvents();
   }
@@ -74,6 +77,14 @@ class AmeegoTTSClient {
             : 'none';
       })
     );
+    this.modelSelect.addEventListener('change', () => {
+      if (this.voiceClonePromptId && this.voiceClonePromptModel !== this.modelSelect.value) {
+        this.voiceClonePromptId = null;
+        this.voiceClonePromptModel = null;
+        this.cloneStatus.textContent = 'Voice clone must be re-created for this model.';
+        this.cloneStatus.className = 'clone-status';
+      }
+    });
     this.createVoiceBtn.addEventListener('click', () => this.uploadRefAudio());
     this.downloadBtn.addEventListener('click', () => this.downloadWav());
 
@@ -273,6 +284,7 @@ class AmeegoTTSClient {
         this.synthesizing = true;
         this.stopBtn.disabled = false;
         this.speakBtn.disabled = true;
+        if (msg.model) this.metricModel.textContent = msg.model;
         break;
 
       case 'synthesis_end':
@@ -284,6 +296,7 @@ class AmeegoTTSClient {
         this.metricRTF.textContent = `${msg.rtf}x`;
         this.metricDuration.textContent = `${(msg.duration_ms / 1000).toFixed(1)}s`;
         this.metricChunks.textContent = msg.total_chunks;
+        if (msg.model) this.metricModel.textContent = msg.model;
         break;
 
       case 'synthesis_cancelled':
@@ -295,7 +308,8 @@ class AmeegoTTSClient {
 
       case 'voice_clone_prompt_ready':
         this.voiceClonePromptId = msg.prompt_id;
-        this.cloneStatus.textContent = `Voice ready (${msg.processing_ms}ms)`;
+        this.voiceClonePromptModel = msg.model;
+        this.cloneStatus.textContent = `Voice ready — ${msg.model} (${msg.processing_ms}ms)`;
         this.cloneStatus.className = 'clone-status success';
         this.createVoiceBtn.disabled = false;
         break;
@@ -352,6 +366,7 @@ class AmeegoTTSClient {
         type: 'synthesize',
         request_id: this.currentRequestId,
         text: text,
+        model: this.modelSelect.value,
         language: this.languageSelect.value,
         voice_clone_prompt_id: voiceMode === 'clone' ? this.voiceClonePromptId : null,
         chunk_size: parseInt(this.chunkSizeSlider.value),
@@ -412,6 +427,7 @@ class AmeegoTTSClient {
         audio_base64: base64,
         ref_text: refText,
         audio_format: ext,
+        model: this.modelSelect.value,
       })
     );
   }

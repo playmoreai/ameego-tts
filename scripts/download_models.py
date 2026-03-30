@@ -16,10 +16,9 @@ TOKENIZER_REPO = "Qwen/Qwen3-TTS-Tokenizer-12Hz"
 def main():
     parser = argparse.ArgumentParser(description="Download Qwen3-TTS models")
     parser.add_argument(
-        "--model-size",
-        choices=list(MODEL_MAP.keys()),
-        default="0.6B",
-        help="Model size to download (default: 0.6B)",
+        "--model-sizes",
+        default="0.6B,1.7B",
+        help="Comma-separated model sizes to download (default: 0.6B,1.7B)",
     )
     parser.add_argument(
         "--cache-dir",
@@ -28,12 +27,18 @@ def main():
     )
     args = parser.parse_args()
 
-    model_id = MODEL_MAP[args.model_size]
+    sizes = [s.strip() for s in args.model_sizes.split(",") if s.strip()]
+
     print(f"Downloading tokenizer: {TOKENIZER_REPO}")
     snapshot_download(TOKENIZER_REPO, cache_dir=args.cache_dir)
 
-    print(f"Downloading model: {model_id}")
-    snapshot_download(model_id, cache_dir=args.cache_dir)
+    for size in sizes:
+        if size not in MODEL_MAP:
+            print(f"WARNING: Unknown model size '{size}', skipping. Available: {list(MODEL_MAP)}")
+            continue
+        model_id = MODEL_MAP[size]
+        print(f"Downloading model: {model_id}")
+        snapshot_download(model_id, cache_dir=args.cache_dir)
 
     print("Download complete.")
 

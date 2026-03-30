@@ -14,6 +14,7 @@ class SynthesizeRequest(BaseModel):
     request_id: str = Field(max_length=128)
     text: str
     language: str = "English"
+    model: str | None = None
     voice_clone_prompt_id: str | None = None
     chunk_size: int | None = Field(default=None, ge=1, le=24)
 
@@ -24,6 +25,7 @@ class UploadRefAudioRequest(BaseModel):
     audio_base64: str
     ref_text: str = ""
     audio_format: str = "wav"
+    model: str | None = None
 
 
 # --- Server -> Client messages ---
@@ -31,6 +33,7 @@ class UploadRefAudioRequest(BaseModel):
 class SynthesisStart(BaseModel):
     type: Literal["synthesis_start"] = "synthesis_start"
     request_id: str
+    model: str
     sample_rate: int = 24000
     sample_width: int = 2
     channels: int = 1
@@ -39,6 +42,7 @@ class SynthesisStart(BaseModel):
 class SynthesisEnd(BaseModel):
     type: Literal["synthesis_end"] = "synthesis_end"
     request_id: str
+    model: str
     total_chunks: int
     total_samples: int
     duration_ms: float
@@ -55,6 +59,7 @@ class SynthesisCancelled(BaseModel):
 class VoiceClonePromptReady(BaseModel):
     type: Literal["voice_clone_prompt_ready"] = "voice_clone_prompt_ready"
     request_id: str
+    model: str
     prompt_id: str
     processing_ms: float
 

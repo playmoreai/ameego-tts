@@ -22,7 +22,7 @@ from server.models import (
     UploadRefAudioRequest,
     VoiceClonePromptReady,
 )
-from server.tts_engine import TTSEngine
+from server.tts_engine import TTSEngine, TTSEngineRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,12 @@ async def _cancel_task(
             logger.warning("Synthesis task error during cancel", exc_info=True)
 
 
-async def handle_websocket(ws: WebSocket, engine: TTSEngine) -> None:
+def _resolve_engine(registry: TTSEngineRegistry, model: str | None) -> TTSEngine:
+    """Resolve model selection to an engine. Raises ValueError if not found."""
+    return registry.get(model)
+
+
+async def handle_websocket(ws: WebSocket, registry: TTSEngineRegistry) -> None:
     logger.info("WebSocket connected: %s", ws.client)
 
     cancel_event: threading.Event | None = None
@@ -89,11 +94,11 @@ async def handle_websocket(ws: WebSocket, engine: TTSEngine) -> None:
                 await _cancel_task(cancel_event, synthesis_task)
                 cancel_event = threading.Event()
                 synthesis_task = asyncio.create_task(
-                    _handle_synthesize(ws, engine, raw, cancel_event)
+                    _handle_synthesize(ws, registry, raw, cancel_event)
                 )
 
             elif msg_type == "upload_ref_audio":
-                await _handle_upload_ref_audio(ws, engine, raw)
+                await _handle_upload_ref_audio(ws, registry, raw)
 
             else:
                 await _send_error(ws, "UNKNOWN_TYPE", f"Unknown message type: {msg_type}")
@@ -112,7 +117,7 @@ async def handle_websocket(ws: WebSocket, engine: TTSEngine) -> None:
 
 async def _handle_synthesize(
     ws: WebSocket,
-    engine: TTSEngine,
+    registry: TTSEngineRegistry,
     raw: dict,
     cancel_event: threading.Event,
 ) -> None:
@@ -120,6 +125,13 @@ async def _handle_synthesize(
         req = SynthesizeRequest(**raw)
     except Exception as e:
         await _send_error(ws, "INVALID_REQUEST", str(e))
+        return
+
+    # Resolve model
+    try:
+        engine = _resolve_engine(registry, req.model)
+    except ValueError as e:
+        await _send_error(ws, "INVALID_MODEL", str(e), req.request_id)
         return
 
     # Validate text
@@ -164,6 +176,7 @@ async def _handle_synthesize(
     await ws.send_json(
         SynthesisStart(
             request_id=req.request_id,
+            model=engine.model_size,
             sample_rate=engine.sample_rate,
         ).model_dump()
     )
@@ -227,6 +240,7 @@ async def _handle_synthesize(
         await ws.send_json(
             SynthesisEnd(
                 request_id=req.request_id,
+                model=engine.model_size,
                 total_chunks=chunk_index,
                 total_samples=total_samples,
                 duration_ms=duration_ms,
@@ -236,20 +250,27 @@ async def _handle_synthesize(
         )
 
         logger.info(
-            "Synthesis complete: %d chunks, %.0fms audio, TTFA=%.0fms, RTF=%.3f",
-            chunk_index, duration_ms, ttfa_ms, rtf,
+            "[%s] Synthesis complete: %d chunks, %.0fms audio, TTFA=%.0fms, RTF=%.3f",
+            engine.model_size, chunk_index, duration_ms, ttfa_ms, rtf,
         )
 
 
 async def _handle_upload_ref_audio(
     ws: WebSocket,
-    engine: TTSEngine,
+    registry: TTSEngineRegistry,
     raw: dict,
 ) -> None:
     try:
         req = UploadRefAudioRequest(**raw)
     except Exception as e:
         await _send_error(ws, "INVALID_REQUEST", str(e))
+        return
+
+    # Resolve model
+    try:
+        engine = _resolve_engine(registry, req.model)
+    except ValueError as e:
+        await _send_error(ws, "INVALID_MODEL", str(e), req.request_id)
         return
 
     # Validate audio format
@@ -311,12 +332,13 @@ async def _handle_upload_ref_audio(
     await ws.send_json(
         VoiceClonePromptReady(
             request_id=req.request_id,
+            model=engine.model_size,
             prompt_id=prompt_id,
             processing_ms=round(elapsed, 1),
         ).model_dump()
     )
 
     logger.info(
-        "Voice clone prompt ready: %s (%.0fms, precompute=%.0fms)",
-        prompt_id, elapsed, precompute_ms,
+        "Voice clone prompt ready: %s (model=%s, %.0fms, precompute=%.0fms)",
+        prompt_id, engine.model_size, elapsed, precompute_ms,
     )

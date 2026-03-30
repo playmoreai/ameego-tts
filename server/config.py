@@ -14,7 +14,8 @@ SUPPORTED_LANGUAGES = frozenset({
 
 
 class Settings(BaseSettings):
-    model_size: str = "0.6B"
+    model_sizes: str = "0.6B,1.7B"
+    default_model_size: str = "0.6B"
     host: str = "0.0.0.0"
     port: int = 8080
     chunk_size: int = 2
@@ -23,8 +24,12 @@ class Settings(BaseSettings):
     clone_prompt_cache_size: int = 32
 
     @property
-    def model_id(self) -> str:
-        return MODEL_ID_MAP[self.model_size]
+    def loaded_model_sizes(self) -> list[str]:
+        sizes = [s.strip() for s in self.model_sizes.split(",") if s.strip()]
+        for s in sizes:
+            if s not in MODEL_ID_MAP:
+                raise ValueError(f"Unknown model size: {s}. Available: {list(MODEL_ID_MAP)}")
+        return sizes
 
     model_config = {"env_prefix": ""}
 

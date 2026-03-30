@@ -218,7 +218,7 @@
     /* Metrics */
     .metrics-grid {
       display: grid;
-      grid-template-columns: repeat(5, 1fr);
+      grid-template-columns: repeat(6, 1fr);
       gap: 12px;
     }
     .metric {
@@ -238,7 +238,7 @@
     }
 
     @media (max-width: 600px) {
-      .metrics-grid { grid-template-columns: repeat(3, 1fr); }
+      .metrics-grid { grid-template-columns: repeat(3, 1fr); grid-row-gap: 8px; }
       .controls-row { flex-direction: column; align-items: stretch; }
     }
   </style>
@@ -284,6 +284,10 @@
       <div class="card-title">Synthesis</div>
       <textarea id="text-input" placeholder="Enter text to synthesize..."></textarea>
       <div class="controls-row">
+        <select id="model-select">
+          <option value="0.6B">Standard (0.6B)</option>
+          <option value="1.7B">High Quality (1.7B)</option>
+        </select>
         <select id="language-select">
           <option value="English">English</option>
           <option value="Chinese">Chinese</option>
@@ -339,6 +343,10 @@
         <div class="metric">
           <div class="metric-value" id="metric-buffer">-</div>
           <div class="metric-label">Buffer</div>
+        </div>
+        <div class="metric">
+          <div class="metric-value" id="metric-model">-</div>
+          <div class="metric-label">Model</div>
         </div>
       </div>
     </div>

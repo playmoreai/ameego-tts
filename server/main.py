@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from server.config import settings
-from server.tts_engine import TTSEngine
+from server.tts_engine import TTSEngineRegistry
 from server.ws_handler import handle_websocket
 
 logging.basicConfig(
@@ -21,14 +21,17 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting Ameego TTS server...")
-    logger.info("Model: %s (%s)", settings.model_id, settings.model_size)
+    logger.info("Models: %s (default: %s)", settings.model_sizes, settings.default_model_size)
 
-    engine = TTSEngine.from_config(settings)
-    engine.warm_up()
-    app.state.tts_engine = engine
+    registry = TTSEngineRegistry.from_config(settings)
+    registry.warm_up_all()
+    app.state.engine_registry = registry
     app.state.active_connections = 0
 
-    logger.info("Server ready. Max connections: %d", settings.max_connections)
+    logger.info(
+        "Server ready. Models: %s, Max connections: %d",
+        registry.available_models, settings.max_connections,
+    )
     yield
 
     logger.info("Shutting down Ameego TTS server...")
@@ -39,12 +42,18 @@ app = FastAPI(title="Ameego TTS", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    engine: TTSEngine = app.state.tts_engine
+    registry: TTSEngineRegistry = app.state.engine_registry
+    models = {}
+    for size, engine in registry.items():
+        models[size] = {
+            "model_id": engine.model.model_name if hasattr(engine.model, 'model_name') else f"Qwen3-TTS-{size}",
+            "sample_rate": engine.sample_rate,
+        }
     return JSONResponse({
         "status": "ok",
-        "model_id": settings.model_id,
-        "model_size": settings.model_size,
-        "sample_rate": engine.sample_rate,
+        "available_models": registry.available_models,
+        "default_model": registry.default_model,
+        "models": models,
         "max_connections": settings.max_connections,
         "active_connections": app.state.active_connections,
     })
@@ -52,7 +61,7 @@ async def health():
 
 @app.websocket("/ws/tts")
 async def websocket_tts(ws: WebSocket):
-    engine: TTSEngine = app.state.tts_engine
+    registry: TTSEngineRegistry = app.state.engine_registry
 
     await ws.accept()
 
@@ -63,7 +72,7 @@ async def websocket_tts(ws: WebSocket):
 
     app.state.active_connections += 1
     try:
-        await handle_websocket(ws, engine)
+        await handle_websocket(ws, registry)
     finally:
         app.state.active_connections -= 1
 

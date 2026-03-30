@@ -21,10 +21,10 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
 # Stage 2: Download model weights
 FROM builder AS model-downloader
 
-ARG MODEL_SIZE=0.6B
+ARG MODEL_SIZES=0.6B,1.7B
 
 COPY scripts/download_models.py /tmp/download_models.py
-RUN python3 /tmp/download_models.py --model-size ${MODEL_SIZE} --cache-dir /models
+RUN python3 /tmp/download_models.py --model-sizes ${MODEL_SIZES} --cache-dir /models
 
 # Stage 3: Runtime
 FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04 AS runtime

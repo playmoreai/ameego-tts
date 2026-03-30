@@ -13,7 +13,7 @@ from typing import Any, AsyncGenerator, Callable, TypeVar
 import numpy as np
 import soundfile as sf
 
-from server.config import Settings
+from server.config import MODEL_ID_MAP, Settings
 
 logger = logging.getLogger(__name__)
 
@@ -41,33 +41,47 @@ def _create_default_ref_audio(sample_rate: int = 24000) -> Path:
 
 
 class TTSEngine:
-    def __init__(self, model, sample_rate: int, config: Settings):
+    def __init__(
+        self,
+        model,
+        sample_rate: int,
+        config: Settings,
+        model_size: str = "0.6B",
+        gpu_lock: asyncio.Lock | None = None,
+    ):
         self.model = model
         self.sample_rate = sample_rate
         self.config = config
-        self._lock = asyncio.Lock()
+        self.model_size = model_size
+        self._lock = gpu_lock or asyncio.Lock()
         self._ref_audio_cache: OrderedDict[str, Path] = OrderedDict()
         self._voice_prompt_cache: OrderedDict[str, dict] = OrderedDict()
         self._default_ref_path = _create_default_ref_audio(sample_rate)
 
     @classmethod
-    def from_config(cls, config: Settings) -> TTSEngine:
+    def from_config(
+        cls,
+        config: Settings,
+        model_size: str,
+        gpu_lock: asyncio.Lock | None = None,
+    ) -> TTSEngine:
         import torch
         from faster_qwen3_tts import FasterQwen3TTS
 
-        logger.info("Loading model %s (%s)...", config.model_id, config.model_size)
+        model_id = MODEL_ID_MAP[model_size]
+        logger.info("Loading model %s (%s)...", model_id, model_size)
         model = FasterQwen3TTS.from_pretrained(
-            config.model_id,
+            model_id,
             device="cuda",
             dtype=torch.bfloat16,
         )
         sample_rate = model.sample_rate
-        logger.info("Model loaded. Sample rate: %d", sample_rate)
-        return cls(model, sample_rate, config)
+        logger.info("Model %s loaded. Sample rate: %d", model_size, sample_rate)
+        return cls(model, sample_rate, config, model_size=model_size, gpu_lock=gpu_lock)
 
     def warm_up(self) -> None:
         """Warm up model to trigger CUDA graph capture."""
-        logger.info("Warming up model (CUDA graph capture)...")
+        logger.info("Warming up model %s (CUDA graph capture)...", self.model_size)
         t0 = time.perf_counter()
         try:
             for _ in self.model.generate_voice_clone_streaming(
@@ -80,12 +94,12 @@ class TTSEngine:
             ):
                 pass
             elapsed = (time.perf_counter() - t0) * 1000
-            logger.info("Warm-up complete in %.0fms", elapsed)
+            logger.info("Warm-up %s complete in %.0fms", self.model_size, elapsed)
         except Exception as e:
             elapsed = (time.perf_counter() - t0) * 1000
             logger.warning(
-                "Warm-up failed (%.0fms): %s. CUDA graphs will capture on first request.",
-                elapsed, e,
+                "Warm-up %s failed (%.0fms): %s. CUDA graphs will capture on first request.",
+                self.model_size, elapsed, e,
             )
 
     # --- GPU lock management ---
@@ -165,8 +179,8 @@ class TTSEngine:
             self._voice_prompt_cache.popitem(last=False)
 
         logger.info(
-            "Pre-computed speaker embedding %s in %.0fms (ref=%s)",
-            prompt_id, elapsed_ms, wav_path.name,
+            "Pre-computed speaker embedding %s in %.0fms (model=%s, ref=%s)",
+            prompt_id, elapsed_ms, self.model_size, wav_path.name,
         )
         return elapsed_ms
 
@@ -208,28 +222,28 @@ class TTSEngine:
         if voice_clone_prompt is not None:
             kwargs["voice_clone_prompt"] = voice_clone_prompt
             logger.info(
-                "Starting synthesis (pre-computed prompt): text=%r, lang=%s, chunk_size=%d",
-                text[:80], language, chunk_size,
+                "[%s] Starting synthesis (pre-computed prompt): text=%r, lang=%s, chunk_size=%d",
+                self.model_size, text[:80], language, chunk_size,
             )
         else:
             kwargs["ref_audio"] = ref_audio_path or str(self._default_ref_path)
             logger.info(
-                "Starting synthesis (ref audio): text=%r, lang=%s, chunk_size=%d, ref=%s",
-                text[:80], language, chunk_size, kwargs["ref_audio"],
+                "[%s] Starting synthesis (ref audio): text=%r, lang=%s, chunk_size=%d, ref=%s",
+                self.model_size, text[:80], language, chunk_size, kwargs["ref_audio"],
             )
 
         for i, (audio_chunk, sr, _) in enumerate(
             self.model.generate_voice_clone_streaming(**kwargs)
         ):
             if cancel_event and cancel_event.is_set():
-                logger.info("Synthesis cancelled at chunk %d", i)
+                logger.info("[%s] Synthesis cancelled at chunk %d", self.model_size, i)
                 break
 
             if i == 0:
                 ttfa = (time.perf_counter() - t0) * 1000
                 logger.info(
-                    "First chunk: shape=%s, range=[%.4f, %.4f], sr=%d, ttfa=%.0fms",
-                    audio_chunk.shape,
+                    "[%s] First chunk: shape=%s, range=[%.4f, %.4f], sr=%d, ttfa=%.0fms",
+                    self.model_size, audio_chunk.shape,
                     float(audio_chunk.min()), float(audio_chunk.max()), sr, ttfa,
                 )
 
@@ -286,3 +300,40 @@ class TTSEngine:
             finally:
                 _cancel.set()
                 await task
+
+
+class TTSEngineRegistry:
+    """Manages multiple TTSEngine instances sharing a single GPU lock."""
+
+    def __init__(self, engines: dict[str, TTSEngine], default_model: str):
+        self._engines = engines
+        self.default_model = default_model
+
+    def get(self, model_size: str | None = None) -> TTSEngine:
+        """Get engine by model size. None returns default."""
+        key = model_size or self.default_model
+        engine = self._engines.get(key)
+        if engine is None:
+            raise ValueError(
+                f"Model not loaded: {key}. Available: {self.available_models}"
+            )
+        return engine
+
+    @property
+    def available_models(self) -> list[str]:
+        return list(self._engines.keys())
+
+    def items(self):
+        return self._engines.items()
+
+    @classmethod
+    def from_config(cls, config: Settings) -> TTSEngineRegistry:
+        gpu_lock = asyncio.Lock()
+        engines: dict[str, TTSEngine] = {}
+        for size in config.loaded_model_sizes:
+            engines[size] = TTSEngine.from_config(config, size, gpu_lock=gpu_lock)
+        return cls(engines, config.default_model_size)
+
+    def warm_up_all(self) -> None:
+        for size, engine in self._engines.items():
+            engine.warm_up()

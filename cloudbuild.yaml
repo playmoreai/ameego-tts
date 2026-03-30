@@ -3,7 +3,7 @@ steps:
     args:
       - 'build'
       - '--build-arg'
-      - 'MODEL_SIZE=${_MODEL_SIZE}'
+      - 'MODEL_SIZES=${_MODEL_SIZES:-0.6B,1.7B}'
       - '-t'
       - '${_IMAGE_TAG}'
       - '.'

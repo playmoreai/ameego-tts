@@ -129,7 +129,7 @@ cmd_up() {
     log "Building Docker image via Cloud Build (this may take 15-30 minutes)..."
     gcloud builds submit "$SCRIPT_DIR" \
         --config="${SCRIPT_DIR}/cloudbuild.yaml" \
-        --substitutions="_MODEL_SIZE=${MODEL_SIZE},_IMAGE_TAG=${IMAGE_TAG}" \
+        --substitutions="_MODEL_SIZES=0.6B%2C1.7B,_IMAGE_TAG=${IMAGE_TAG}" \
         --quiet
 
     log "Image pushed: ${IMAGE_TAG}"
@@ -192,9 +192,9 @@ docker run -d \
     --gpus all \
     --restart unless-stopped \
     -p ${SERVER_PORT}:${SERVER_PORT} \
-    -e MODEL_SIZE=${MODEL_SIZE} \
+    -e MODEL_SIZES=0.6B,1.7B \
+    -e DEFAULT_MODEL_SIZE=${MODEL_SIZE} \
     -e SERVER_PORT=${SERVER_PORT} \
-    -e GPU_MEMORY_UTIL=0.85 \
     ${IMAGE_TAG}
 
 echo 'Ameego TTS container started'
