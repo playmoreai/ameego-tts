@@ -43,7 +43,6 @@ class AmeegoTTSClient {
     this.voiceModeRadios = document.querySelectorAll('input[name="voice-mode"]');
     this.clonePanel = document.getElementById('clone-panel');
     this.refAudioInput = document.getElementById('ref-audio');
-    this.refTextInput = document.getElementById('ref-text');
     this.createVoiceBtn = document.getElementById('create-voice-btn');
     this.cloneStatus = document.getElementById('clone-status');
     this.downloadBtn = document.getElementById('download-btn');
@@ -422,19 +421,13 @@ class AmeegoTTSClient {
     this.synthesizing = false;
     this.stopBtn.disabled = true;
     this.speakBtn.disabled = false;
+    if (this.recordedChunks.length > 0) this.downloadBtn.disabled = false;
   }
 
   async uploadRefAudio() {
     const file = this.refAudioInput.files[0];
     if (!file) {
       this.cloneStatus.textContent = 'Please select an audio file.';
-      this.cloneStatus.className = 'clone-status error';
-      return;
-    }
-
-    const refText = this.refTextInput.value.trim();
-    if (!refText) {
-      this.cloneStatus.textContent = 'Please enter the reference text.';
       this.cloneStatus.className = 'clone-status error';
       return;
     }
@@ -455,7 +448,6 @@ class AmeegoTTSClient {
         type: 'upload_ref_audio',
         request_id: uuid(),
         audio_base64: base64,
-        ref_text: refText,
         audio_format: ext,
         model: this.modelSelect.value,
       })

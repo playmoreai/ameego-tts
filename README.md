@@ -75,7 +75,8 @@ The script builds via Cloud Build, creates a GCE VM with GPU, and waits for heal
 
 | Variable | Default | Description |
 |---|---|---|
-| `MODEL_SIZE` | `0.6B` | Model size: `0.6B` or `1.7B` |
+| `MODEL_SIZES` | `0.6B,1.7B` | Comma-separated model sizes to load |
+| `DEFAULT_MODEL_SIZE` | `0.6B` | Default model when client doesn't specify |
 | `CHUNK_SIZE` | `2` | Streaming chunk size (codec steps per audio chunk, 1=~83ms, 2=~167ms) |
 | `MAX_CONNECTIONS` | `4` | Max concurrent WebSocket connections |
 | `MAX_TEXT_LENGTH` | `5000` | Max input text length (characters) |
@@ -104,6 +105,7 @@ Connect to `ws://<server-ip>:8080/ws/tts`.
   "request_id": "uuid",
   "text": "Hello, world!",
   "language": "English",
+  "model": "0.6B",
   "voice_clone_prompt_id": null,
   "chunk_size": 2
 }
@@ -115,8 +117,8 @@ Connect to `ws://<server-ip>:8080/ws/tts`.
   "type": "upload_ref_audio",
   "request_id": "uuid",
   "audio_base64": "<base64-encoded-audio>",
-  "ref_text": "Transcription of the audio.",
-  "audio_format": "wav"
+  "audio_format": "wav",
+  "model": "0.6B"
 }
 ```
 
@@ -140,10 +142,10 @@ Bytes 16+:   Raw PCM16 audio (int16 LE, mono)
 ```
 
 **Control messages** — JSON text frames:
-- `synthesis_start` — synthesis began
-- `synthesis_end` — includes `ttfa_ms`, `rtf`, `total_chunks`, `duration_ms`
+- `synthesis_start` — synthesis began, includes `model`
+- `synthesis_end` — includes `model`, `ttfa_ms`, `rtf`, `total_chunks`, `duration_ms`
 - `synthesis_cancelled` — synthesis was stopped by client
-- `voice_clone_prompt_ready` — voice clone prompt cached, returns `prompt_id`
+- `voice_clone_prompt_ready` — voice clone prompt cached, returns `prompt_id` and `model`
 - `error` — includes `code` and `message`
 
 ## Project Structure
@@ -176,7 +178,7 @@ ameego-tts/
 pip install -r requirements.txt
 
 # Run server
-MODEL_SIZE=0.6B python -m uvicorn server.main:app --host 0.0.0.0 --port 8080
+MODEL_SIZES=0.6B python -m uvicorn server.main:app --host 0.0.0.0 --port 8080
 
 # Open http://localhost:8080
 ```

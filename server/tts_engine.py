@@ -28,7 +28,12 @@ _DEFAULT_REF_PATH = _REF_AUDIO_DIR / "_default_ref.wav"
 
 
 def _create_default_ref_audio(sample_rate: int = 24000) -> Path:
-    """Generate a short speech-like reference WAV for warmup & default voice."""
+    """Generate a short speech-like reference WAV for warmup & default voice.
+
+    Only writes the file once; subsequent calls are no-ops.
+    """
+    if _DEFAULT_REF_PATH.exists():
+        return _DEFAULT_REF_PATH
     duration = 1.5  # seconds
     t = np.linspace(0, duration, int(sample_rate * duration), dtype=np.float32)
     signal = 0.3 * np.sin(2 * np.pi * 200 * t + 4 * np.sin(2 * np.pi * 3 * t))
@@ -140,12 +145,11 @@ class TTSEngine:
                 finally:
                     tmp_path.unlink(missing_ok=True)
 
-        # LRU cache
+        # LRU cache (don't delete files on eviction — shared across engines)
         self._ref_audio_cache[hash_key] = wav_path
         self._ref_audio_cache.move_to_end(hash_key)
         while len(self._ref_audio_cache) > self.config.clone_prompt_cache_size:
-            _, old_path = self._ref_audio_cache.popitem(last=False)
-            old_path.unlink(missing_ok=True)
+            self._ref_audio_cache.popitem(last=False)
         return hash_key, wav_path
 
     def precompute_voice_prompt(self, prompt_id: str) -> float:
@@ -335,5 +339,5 @@ class TTSEngineRegistry:
         return cls(engines, config.default_model_size)
 
     def warm_up_all(self) -> None:
-        for size, engine in self._engines.items():
+        for engine in self._engines.values():
             engine.warm_up()

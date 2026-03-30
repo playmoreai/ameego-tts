@@ -4,7 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-ALLOWED_AUDIO_FORMATS = {"wav", "mp3", "flac", "ogg", "m4a", "webm", "opus"}
+ALLOWED_AUDIO_FORMATS = frozenset({"wav", "mp3", "flac", "ogg", "m4a", "webm", "opus"})
 
 
 # --- Client -> Server messages ---

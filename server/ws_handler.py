@@ -22,7 +22,7 @@ from server.models import (
     UploadRefAudioRequest,
     VoiceClonePromptReady,
 )
-from server.tts_engine import TTSEngine, TTSEngineRegistry
+from server.tts_engine import TTSEngineRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +63,6 @@ async def _cancel_task(
             pass
         except Exception:
             logger.warning("Synthesis task error during cancel", exc_info=True)
-
-
-def _resolve_engine(registry: TTSEngineRegistry, model: str | None) -> TTSEngine:
-    """Resolve model selection to an engine. Raises ValueError if not found."""
-    return registry.get(model)
 
 
 async def handle_websocket(ws: WebSocket, registry: TTSEngineRegistry) -> None:
@@ -129,7 +124,7 @@ async def _handle_synthesize(
 
     # Resolve model
     try:
-        engine = _resolve_engine(registry, req.model)
+        engine = registry.get(req.model)
     except ValueError as e:
         await _send_error(ws, "INVALID_MODEL", str(e), req.request_id)
         return
@@ -268,7 +263,7 @@ async def _handle_upload_ref_audio(
 
     # Resolve model
     try:
-        engine = _resolve_engine(registry, req.model)
+        engine = registry.get(req.model)
     except ValueError as e:
         await _send_error(ws, "INVALID_MODEL", str(e), req.request_id)
         return
