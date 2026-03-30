@@ -190,12 +190,42 @@ class AmeegoTTSClient {
     }
   }
 
+  async fetchAvailableModels() {
+    const MODEL_LABELS = {
+      '0.6B': 'Standard (0.6B)',
+      '1.7B': 'High Quality (1.7B)',
+    };
+    try {
+      const res = await fetch('/health');
+      const data = await res.json();
+      const models = data.available_models || [];
+      const defaultModel = data.default_model || models[0];
+      this.modelSelect.innerHTML = '';
+      for (const m of models) {
+        const opt = document.createElement('option');
+        opt.value = m;
+        opt.textContent = MODEL_LABELS[m] || m;
+        if (m === defaultModel) opt.selected = true;
+        this.modelSelect.appendChild(opt);
+      }
+    } catch (e) {
+      console.warn('Failed to fetch available models:', e);
+      if (this.modelSelect.options.length === 0) {
+        const opt = document.createElement('option');
+        opt.value = '0.6B';
+        opt.textContent = 'Standard (0.6B)';
+        this.modelSelect.appendChild(opt);
+      }
+    }
+  }
+
   async connect() {
     if (this.ws) return;
     this.setStatus('connecting');
 
     try {
       await this.initAudio();
+      await this.fetchAvailableModels();
 
       this.ws = new WebSocket(this.getWsUrl());
       this.ws.binaryType = 'arraybuffer';
