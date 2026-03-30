@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import sys
 import tempfile
 import threading
 import time
@@ -13,11 +14,17 @@ from typing import Any, AsyncGenerator, Callable, TypeVar
 import numpy as np
 import soundfile as sf
 
-from server.config import MODEL_ID_MAP, Settings
+from server.config import Settings
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+_VENDORED_PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "vendor" / "faster-qwen3-tts"
+if _VENDORED_PACKAGE_ROOT.exists():
+    vendored_path = str(_VENDORED_PACKAGE_ROOT)
+    if vendored_path not in sys.path:
+        sys.path.insert(0, vendored_path)
 
 # Temp directory for reference audio files (deterministic names for cache reuse)
 _REF_AUDIO_DIR = Path(tempfile.gettempdir()) / "ameego_tts_ref"
@@ -70,15 +77,22 @@ class TTSEngine:
         model_size: str,
         gpu_lock: asyncio.Lock | None = None,
     ) -> TTSEngine:
-        import torch
         from faster_qwen3_tts import FasterQwen3TTS
 
-        model_id = MODEL_ID_MAP[model_size]
-        logger.info("Loading model %s (%s)...", model_id, model_size)
+        model_id = config.model_id_for_size(model_size)
+        logger.info(
+            "Loading model %s (%s, device=%s, dtype=%s)...",
+            model_id,
+            model_size,
+            config.model_device,
+            config.model_dtype,
+        )
         model = FasterQwen3TTS.from_pretrained(
             model_id,
-            device="cuda",
-            dtype=torch.bfloat16,
+            device=config.model_device,
+            dtype=config.model_dtype,
+            attn_implementation=config.attn_implementation,
+            max_seq_len=config.cuda_graph_max_seq_len,
         )
         sample_rate = model.sample_rate
         logger.info("Model %s loaded. Sample rate: %d", model_size, sample_rate)

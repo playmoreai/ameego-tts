@@ -279,7 +279,8 @@ async def _handle_upload_ref_audio(
         return
 
     try:
-        audio_bytes = base64.b64decode(req.audio_base64)
+        audio_base64 = "".join(req.audio_base64.split())
+        audio_bytes = base64.b64decode(audio_base64, validate=True)
     except Exception:
         await _send_error(
             ws, "INVALID_AUDIO", "Invalid base64-encoded audio data.", req.request_id,

@@ -19,6 +19,9 @@ DEPLOY_ENV="${SCRIPT_DIR}/.deploy.env"
 INSTANCE_NAME="ameego-tts"
 DEFAULT_ZONE="asia-northeast3-a"
 DEFAULT_MODEL="0.6B"
+DEFAULT_MODEL_SIZES="0.6B,1.7B"
+DEFAULT_MODEL_ID_0_6B="Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+DEFAULT_MODEL_ID_1_7B="Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 MACHINE_TYPE="g2-standard-4"
 BOOT_DISK_SIZE="100GB"
 IMAGE_FAMILY="common-cu128-ubuntu-2204-nvidia-570"
@@ -48,9 +51,11 @@ load_deploy_env() {
 save_deploy_env() {
     cat > "$DEPLOY_ENV" <<EOF
 ZONE=${ZONE}
-MODEL_SIZE=${MODEL_SIZE}
+MODEL_SIZES=${MODEL_SIZES}
+DEFAULT_MODEL_SIZE=${DEFAULT_MODEL_SIZE}
 PROJECT_ID=${PROJECT_ID}
 INSTANCE_NAME=${INSTANCE_NAME}
+SERVER_PORT=${SERVER_PORT}
 EOF
 }
 
@@ -66,6 +71,51 @@ get_external_ip() {
     gcloud compute instances describe "$INSTANCE_NAME" \
         --zone="$ZONE" \
         --format='get(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null
+}
+
+build_docker_env_args() {
+    local key value
+    local args=()
+
+    for key in "$@"; do
+        if [ "${!key+x}" = "x" ] && [ -n "${!key}" ]; then
+            value="${!key}"
+            args+=("-e" "${key}=${value}")
+        fi
+    done
+
+    printf '%q ' "${args[@]}"
+}
+
+validate_model_sizes() {
+    local sizes_csv="$1"
+    local size
+    IFS=',' read -r -a sizes <<< "$sizes_csv"
+    if [ "${#sizes[@]}" -eq 0 ]; then
+        err "MODEL_SIZES cannot be empty"
+        exit 1
+    fi
+    for size in "${sizes[@]}"; do
+        size="${size//[[:space:]]/}"
+        case "$size" in
+            0.6B|1.7B) ;;
+            *)
+                err "Unsupported model size in MODEL_SIZES: ${size}. Allowed: 0.6B,1.7B"
+                exit 1
+                ;;
+        esac
+    done
+}
+
+validate_model_id() {
+    local name="$1"
+    local value="$2"
+    case "$value" in
+        *","*|*$'\n'*|*$'\r'*)
+            err "${name} cannot contain commas or newlines: ${value}"
+            exit 1
+            ;;
+    esac
 }
 
 check_prerequisites() {
@@ -105,14 +155,54 @@ cmd_up() {
     local REGION="${ZONE%-*}"
     local REPO_NAME="ameego-tts"
     local REGISTRY="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}"
-    local IMAGE_TAG="${REGISTRY}/ameego-tts:${MODEL_SIZE}"
+    local MODEL_SIZES_TO_LOAD="${MODEL_SIZES:-$DEFAULT_MODEL_SIZES}"
+    local DEFAULT_MODEL_SIZE_TO_USE="${DEFAULT_MODEL_SIZE:-$MODEL_SIZE}"
+    local MODEL_ID_0_6B_TO_USE="${MODEL_ID_0_6B:-$DEFAULT_MODEL_ID_0_6B}"
+    local MODEL_ID_1_7B_TO_USE="${MODEL_ID_1_7B:-$DEFAULT_MODEL_ID_1_7B}"
+    local IMAGE_TAG="${REGISTRY}/ameego-tts:${DEFAULT_MODEL_SIZE_TO_USE}"
+
+    validate_model_sizes "$MODEL_SIZES_TO_LOAD"
+    validate_model_id "MODEL_ID_0_6B" "$MODEL_ID_0_6B_TO_USE"
+    validate_model_id "MODEL_ID_1_7B" "$MODEL_ID_1_7B_TO_USE"
+
+    case ",${MODEL_SIZES_TO_LOAD}," in
+        *",${DEFAULT_MODEL_SIZE_TO_USE},"*) ;;
+        *)
+            err "DEFAULT_MODEL_SIZE=${DEFAULT_MODEL_SIZE_TO_USE} must be included in MODEL_SIZES=${MODEL_SIZES_TO_LOAD}"
+            exit 1
+            ;;
+    esac
+
+    MODEL_SIZES="${MODEL_SIZES_TO_LOAD}"
+    DEFAULT_MODEL_SIZE="${DEFAULT_MODEL_SIZE_TO_USE}"
+    MODEL_ID_0_6B="${MODEL_ID_0_6B_TO_USE}"
+    MODEL_ID_1_7B="${MODEL_ID_1_7B_TO_USE}"
+
+    local DOCKER_ENV_ARGS
+    DOCKER_ENV_ARGS="$(
+        build_docker_env_args \
+            MODEL_SIZES \
+            DEFAULT_MODEL_SIZE \
+            SERVER_PORT \
+            MODEL_ID_0_6B \
+            MODEL_ID_1_7B \
+            MODEL_DEVICE \
+            MODEL_DTYPE \
+            ATTN_IMPLEMENTATION \
+            CUDA_GRAPH_MAX_SEQ_LEN \
+            CHUNK_SIZE \
+            MAX_CONNECTIONS \
+            MAX_TEXT_LENGTH \
+            CLONE_PROMPT_CACHE_SIZE
+    )"
 
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║       Ameego TTS — Deploying         ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
     echo ""
-    echo "  Model:    Qwen3-TTS-${MODEL_SIZE}"
+    echo "  Default:  Qwen3-TTS-${DEFAULT_MODEL_SIZE_TO_USE}"
+    echo "  Load:     ${MODEL_SIZES_TO_LOAD}"
     echo "  Machine:  ${MACHINE_TYPE}"
     echo "  Zone:     ${ZONE}"
     echo "  Spot:     ${SPOT_FLAG:-no}"
@@ -129,18 +219,25 @@ cmd_up() {
     log "Building Docker image via Cloud Build (this may take 15-30 minutes)..."
     gcloud builds submit "$SCRIPT_DIR" \
         --config="${SCRIPT_DIR}/cloudbuild.yaml" \
-        --substitutions="_MODEL_SIZES=0.6B%2C1.7B,_IMAGE_TAG=${IMAGE_TAG}" \
+        --substitutions="_MODEL_SIZES=${MODEL_SIZES_TO_LOAD//,/%2C},_MODEL_ID_0_6B=${MODEL_ID_0_6B_TO_USE},_MODEL_ID_1_7B=${MODEL_ID_1_7B_TO_USE},_IMAGE_TAG=${IMAGE_TAG}" \
         --quiet
 
     log "Image pushed: ${IMAGE_TAG}"
 
     # 3. Create firewall rule
     log "Ensuring firewall rule..."
-    gcloud compute firewall-rules create "$FIREWALL_RULE" \
-        --allow=tcp:${SERVER_PORT} \
-        --target-tags="$INSTANCE_NAME" \
-        --description="Allow HTTP access to Ameego TTS" \
-        --quiet 2>/dev/null || true
+    if gcloud compute firewall-rules describe "$FIREWALL_RULE" --quiet >/dev/null 2>&1; then
+        gcloud compute firewall-rules update "$FIREWALL_RULE" \
+            --allow=tcp:${SERVER_PORT} \
+            --target-tags="$INSTANCE_NAME" \
+            --quiet
+    else
+        gcloud compute firewall-rules create "$FIREWALL_RULE" \
+            --allow=tcp:${SERVER_PORT} \
+            --target-tags="$INSTANCE_NAME" \
+            --description="Allow HTTP access to Ameego TTS" \
+            --quiet
+    fi
 
     # 4. Create GCE VM with GPU
     log "Creating GCE instance: ${INSTANCE_NAME} in ${ZONE}..."
@@ -192,9 +289,7 @@ docker run -d \
     --gpus all \
     --restart unless-stopped \
     -p ${SERVER_PORT}:${SERVER_PORT} \
-    -e MODEL_SIZES=0.6B,1.7B \
-    -e DEFAULT_MODEL_SIZE=${MODEL_SIZE} \
-    -e SERVER_PORT=${SERVER_PORT} \
+    ${DOCKER_ENV_ARGS} \
     ${IMAGE_TAG}
 
 echo 'Ameego TTS container started'
@@ -337,11 +432,12 @@ cmd_logs() {
 
     ZONE="${ZONE:-$DEFAULT_ZONE}"
     gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" \
-        --command="docker logs -f ameego-tts 2>&1 | tail -100"
+        --command="docker logs --tail 100 -f ameego-tts 2>&1"
 }
 
 cmd_url() {
     load_deploy_env
+    check_prerequisites
     ZONE="${ZONE:-$DEFAULT_ZONE}"
 
     local IP=$(get_external_ip)
@@ -374,9 +470,10 @@ case "${1:-help}" in
         echo "  url                                              Print server URL"
         echo ""
         echo "Examples:"
-        echo "  $0 up                                            Deploy 0.6B model"
-        echo "  $0 up --model 1.7B --spot                       Deploy 1.7B model on spot"
-        echo "  $0 up --model 0.6B --zone us-west2-b            Deploy in specific zone"
+        echo "  $0 up                                            Deploy with both models loaded, defaulting to 0.6B"
+        echo "  $0 up --model 1.7B --spot                       Deploy with both models loaded, defaulting to 1.7B on spot"
+        echo "  MODEL_SIZES=0.6B $0 up                          Deploy only the 0.6B model"
+        echo "  $0 up --zone us-west2-b                         Deploy in specific zone"
         exit 1
         ;;
 esac

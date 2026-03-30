@@ -1,0 +1,14 @@
+.git
+.gitignore
+.deploy.env
+.env
+.venv
+venv
+env
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.DS_Store
+models/
+docs/

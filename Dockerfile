@@ -13,18 +13,25 @@ RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 COPY requirements.txt /tmp/requirements.txt
+COPY vendor/faster-qwen3-tts /tmp/vendor/faster-qwen3-tts
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir torch==2.11.0 torchaudio --index-url https://download.pytorch.org/whl/cu128 && \
     pip install --no-cache-dir -r /tmp/requirements.txt && \
-    pip install --no-cache-dir git+https://github.com/andimarafioti/faster-qwen3-tts.git
+    pip install --no-cache-dir /tmp/vendor/faster-qwen3-tts
 
 # Stage 2: Download model weights
 FROM builder AS model-downloader
 
 ARG MODEL_SIZES=0.6B,1.7B
+ARG MODEL_ID_0_6B=Qwen/Qwen3-TTS-12Hz-0.6B-Base
+ARG MODEL_ID_1_7B=Qwen/Qwen3-TTS-12Hz-1.7B-Base
 
 COPY scripts/download_models.py /tmp/download_models.py
-RUN python3 /tmp/download_models.py --model-sizes ${MODEL_SIZES} --cache-dir /models
+RUN python3 /tmp/download_models.py \
+    --model-sizes ${MODEL_SIZES} \
+    --model-id-0-6b ${MODEL_ID_0_6B} \
+    --model-id-1-7b ${MODEL_ID_1_7B} \
+    --cache-dir /models
 
 # Stage 3: Runtime
 FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04 AS runtime

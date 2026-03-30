@@ -14,6 +14,7 @@ env/
 .mypy_cache/
 .pytest_cache/
 *.wav
+!vendor/faster-qwen3-tts/ref_audio.wav
 *.mp3
 *.flac
 *.ogg
