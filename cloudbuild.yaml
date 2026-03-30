@@ -3,13 +3,15 @@ steps:
     args:
       - 'build'
       - '--build-arg'
-      - 'MODEL_SIZES=${_MODEL_SIZES:-0.6B,1.7B}'
+      - 'MODEL_SIZES=${_MODEL_SIZES}'
       - '-t'
       - '${_IMAGE_TAG}'
       - '.'
     timeout: '3600s'
   - name: 'gcr.io/cloud-builders/docker'
     args: ['push', '${_IMAGE_TAG}']
+substitutions:
+  _MODEL_SIZES: '0.6B,1.7B'
 images:
   - '${_IMAGE_TAG}'
 timeout: '3600s'
