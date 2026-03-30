@@ -7,8 +7,8 @@ Default deployment target:
 - GPU: `NVIDIA L4`
 
 Main docs:
-- API: [docs/api.md](/Users/jin/Workspace/ameego-tts/docs/api.md)
-- Deploy: [docs/deploy.md](/Users/jin/Workspace/ameego-tts/docs/deploy.md)
+- API: [docs/api.md](docs/api.md)
+- Deploy: [docs/deploy.md](docs/deploy.md)
 
 ## Quick Start
 
@@ -32,6 +32,13 @@ Common commands:
 ./deploy.sh ssh
 ./deploy.sh down
 ```
+
+## Repo Layout
+
+- `server/`: FastAPI server, runtime pool, WebSocket protocol, voice storage
+- `web/`: bundled test UI
+- `scripts/`: build-time helper scripts
+- `docs/`: operator and integration docs
 
 ## Defaults
 
