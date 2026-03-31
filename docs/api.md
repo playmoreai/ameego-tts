@@ -62,6 +62,7 @@ Important fields:
 - `status`: `ready`, `loading`, `switching`, `error`
 - `available_synth_capacity`: synth slots available right now
 - `waiting_synth_requests`: queued synth requests waiting for capacity
+- `max_waiting_synth_requests`: max queued synth requests allowed before `SERVER_BUSY`
 - `max_connections`: max open WebSocket connections
 
 ## Voices
@@ -182,6 +183,8 @@ Voice design:
 }
 ```
 
+If the request is still queued or already streaming, the server completes it with `synthesis_cancelled`.
+
 #### `ping`
 
 ```json
@@ -282,6 +285,8 @@ WebSocket:
 - Do not depend on `voice_clone_prompt_id` for production integrations
 - Expect `SERVER_BUSY` during load and retry with backoff
 - Check `/health` before opening large bursts of synth requests
+- Current `api` deployment allows `1` active synth request and `1` waiting synth request
+- Additional synth requests beyond current active and waiting capacity fail immediately with `SERVER_BUSY`
 - Voice assets are durable for the deployment's configured `VOICE_STORAGE_DIR`
 
 ## Minimal Example

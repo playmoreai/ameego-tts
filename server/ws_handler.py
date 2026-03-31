@@ -113,6 +113,8 @@ async def _handle_synthesize(
     raw: dict,
     cancel_event: threading.Event,
 ) -> None:
+    request_id = raw.get("request_id")
+    chunk_index = 0
     try:
         req = SynthesizeRequest(**raw)
     except Exception as e:
@@ -209,7 +211,6 @@ async def _handle_synthesize(
 
             t_start = time.perf_counter()
             t_first_chunk = None
-            chunk_index = 0
             total_bytes = 0
             cancelled = False
 
@@ -282,6 +283,18 @@ async def _handle_synthesize(
                 ttfa_ms,
                 rtf,
             )
+    except asyncio.CancelledError:
+        logger.info("Synthesis task cancelled: request_id=%s, chunks_sent=%d", request_id, chunk_index)
+        if request_id:
+            try:
+                await ws.send_json(
+                    SynthesisCancelled(
+                        request_id=request_id,
+                        chunks_sent=chunk_index,
+                    ).model_dump()
+                )
+            except Exception:
+                pass
     except RuntimeStateError as e:
         await _send_error(ws, e.code, e.message, req.request_id)
 
