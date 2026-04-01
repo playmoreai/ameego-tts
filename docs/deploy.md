@@ -18,7 +18,7 @@ This guide follows the shared engine deployment contract defined in the `ameego-
 Default web behavior:
 
 - bundled web UI enabled
-- default model: `1.7B`
+- default model: `0.6B`
 - default build: `full`
 
 ## API Deploy
@@ -30,13 +30,13 @@ Default web behavior:
 Default api behavior:
 
 - bundled web UI disabled
-- default model: `1.7B`
+- default model: `0.6B`
 - default build: `fast`
 
 ## Common Overrides
 
 ```bash
-./deploy.sh up --profile web --model 0.6B
+./deploy.sh up --profile web --model 1.7B
 ./deploy.sh up --profile api --build full
 ./deploy.sh up --profile web --zone us-central1-c --spot
 VOICE_DESIGN_ENABLED=true MODEL_SIZES=0.6B,1.7B ./deploy.sh up --profile web

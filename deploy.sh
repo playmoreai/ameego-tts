@@ -9,10 +9,10 @@ CONTAINER_NAME="ameego-tts"
 REPO_NAME="ameego-tts"
 DEFAULT_PROFILE="web"
 DEFAULT_ZONE="asia-northeast3-a"
-DEFAULT_MODEL="1.7B"
+DEFAULT_MODEL="0.6B"
 DEFAULT_BUILD_PROFILE_WEB="full"
 DEFAULT_BUILD_PROFILE_API="fast"
-DEFAULT_MODEL_SIZES="1.7B"
+DEFAULT_MODEL_SIZES="0.6B"
 DEFAULT_MODEL_ID_0_6B="Qwen/Qwen3-TTS-12Hz-0.6B-Base"
 DEFAULT_MODEL_ID_1_7B="Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 DEFAULT_CLONE_0_6B_REPLICAS="2"
@@ -164,6 +164,7 @@ save_deploy_env() {
         write_deploy_env_value "DEPLOY_INITIAL_MODEL_SIZE" "${INITIAL_CLONE_MODEL_SIZE}"
         write_deploy_env_value "DEPLOY_VOICE_DESIGN_ENABLED" "${VOICE_DESIGN_ENABLED}"
     } > "$DEPLOY_ENV"
+    chmod 600 "$DEPLOY_ENV"
 }
 
 resolve_profile() {
@@ -366,6 +367,30 @@ check_prerequisites() {
     log "Project: ${PROJECT_ID}" >&2
 }
 
+ensure_private_egress() {
+    local region="$1"
+    local router="ameego-private-egress-${region}"
+    local nat="${router}-nat"
+
+    log "Ensuring private egress in ${region}..." >&2
+    gcloud compute networks subnets update default \
+        --region="$region" \
+        --enable-private-ip-google-access \
+        --quiet >/dev/null
+
+    gcloud compute routers create "$router" \
+        --network=default \
+        --region="$region" \
+        --quiet >/dev/null 2>&1 || true
+
+    gcloud compute routers nats create "$nat" \
+        --router="$router" \
+        --region="$region" \
+        --nat-all-subnet-ip-ranges \
+        --auto-allocate-nat-external-ips \
+        --quiet >/dev/null 2>&1 || true
+}
+
 other_profile_instance_exists() {
     local other=""
     other="$(
@@ -432,7 +457,11 @@ maybe_register_gateway_backend() {
     [ -n "${GATEWAY_ADMIN_TOKEN:-}" ] || return 0
     local payload
     payload=$(printf '{"service":"tts","profile":"api","internal_ip":"%s","port":%s,"scheme":"http","ws_scheme":"ws"}' "$internal_ip" "$SERVER_PORT")
-    curl -fsS --connect-timeout 3 --max-time 10 -X POST "${GATEWAY_ADMIN_URL%/}/admin/backends/register" \
+    local -a curl_cmd=(curl -fsS --connect-timeout 3 --max-time 10)
+    if [ -n "${GATEWAY_ADMIN_DOMAIN:-}" ] && [ -n "${GATEWAY_ADMIN_IP:-}" ]; then
+        curl_cmd+=(--resolve "${GATEWAY_ADMIN_DOMAIN}:443:${GATEWAY_ADMIN_IP}")
+    fi
+    "${curl_cmd[@]}" -X POST "${GATEWAY_ADMIN_URL%/}/admin/backends/register" \
         -H "Authorization: Bearer ${GATEWAY_ADMIN_TOKEN}" \
         -H "content-type: application/json" \
         -d "$payload" >/dev/null 2>&1 || warn "Gateway registration failed for tts"
@@ -442,7 +471,11 @@ maybe_deregister_gateway_backend() {
     [ "$PROFILE" = "api" ] || return 0
     [ -n "${GATEWAY_ADMIN_URL:-}" ] || return 0
     [ -n "${GATEWAY_ADMIN_TOKEN:-}" ] || return 0
-    curl -fsS --connect-timeout 3 --max-time 10 -X POST "${GATEWAY_ADMIN_URL%/}/admin/backends/deregister" \
+    local -a curl_cmd=(curl -fsS --connect-timeout 3 --max-time 10)
+    if [ -n "${GATEWAY_ADMIN_DOMAIN:-}" ] && [ -n "${GATEWAY_ADMIN_IP:-}" ]; then
+        curl_cmd+=(--resolve "${GATEWAY_ADMIN_DOMAIN}:443:${GATEWAY_ADMIN_IP}")
+    fi
+    "${curl_cmd[@]}" -X POST "${GATEWAY_ADMIN_URL%/}/admin/backends/deregister" \
         -H "Authorization: Bearer ${GATEWAY_ADMIN_TOKEN}" \
         -H "content-type: application/json" \
         -d '{"service":"tts","profile":"api"}' >/dev/null 2>&1 || warn "Gateway deregistration failed for tts"
@@ -492,6 +525,11 @@ cmd_up() {
     ZONE="$requested_zone"
     check_prerequisites
 
+    local region="${ZONE%-*}"
+    if [ "$PROFILE" = "api" ]; then
+        ensure_private_egress "$region"
+    fi
+
     if other_profile_instance_exists; then
         err "Another TTS profile is already deployed. Run './deploy.sh down --profile web' or './deploy.sh down --profile api' first."
         exit 1
@@ -505,7 +543,6 @@ cmd_up() {
     fi
     build_profile_to_use="$(normalize_build_profile "$build_profile_to_use")"
 
-    local region="${ZONE%-*}"
     local registry="${region}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}"
     local model_sizes_to_load=""
     if [ "${MODEL_SIZES+x}" = "x" ] && [ -n "${MODEL_SIZES}" ]; then
@@ -712,6 +749,10 @@ if ! command -v nvidia-ctk &>/dev/null; then
 fi
 
 gcloud auth configure-docker ${region}-docker.pkg.dev --quiet 2>/dev/null || true
+ACCESS_TOKEN=\$(curl -fsSL -H "Metadata-Flavor: Google" \
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+docker login -u oauth2accesstoken -p "\${ACCESS_TOKEN}" https://${region}-docker.pkg.dev
 
 echo 'Pulling image...'
 docker pull ${image_tag}
