@@ -18,7 +18,7 @@ This guide follows the shared engine deployment contract defined in the `ameego-
 Default web behavior:
 
 - bundled web UI enabled
-- default model: `0.6B`
+- default model: `1.7B`
 - default build: `full`
 
 ## API Deploy
@@ -30,7 +30,7 @@ Default web behavior:
 Default api behavior:
 
 - bundled web UI disabled
-- default model: `0.6B`
+- default model: `1.7B`
 - default build: `fast`
 
 ## Common Overrides

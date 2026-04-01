@@ -19,10 +19,10 @@ SUPPORTED_LANGUAGES = frozenset({
 class Settings(BaseSettings):
     app_profile: Literal["test", "api"] = "test"
     allowed_origins: str = ""
-    model_sizes: str = "0.6B"
-    default_model_size: str = "0.6B"
+    model_sizes: str = "1.7B"
+    default_model_size: str = "1.7B"
     initial_mode: Literal["voice_clone", "voice_design"] = "voice_clone"
-    initial_clone_model_size: str = "0.6B"
+    initial_clone_model_size: str = "1.7B"
     voice_design_enabled: bool = False
     voice_design_model_id: str = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
     voice_storage_dir: str = ""

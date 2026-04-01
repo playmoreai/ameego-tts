@@ -57,7 +57,7 @@ RUN mkdir -p /root/.cache/huggingface
 # Stage 3: Download model weights
 FROM builder AS model-downloader
 
-ARG MODEL_SIZES=0.6B
+ARG MODEL_SIZES=1.7B
 ARG MODEL_ID_0_6B=Qwen/Qwen3-TTS-12Hz-0.6B-Base
 ARG MODEL_ID_1_7B=Qwen/Qwen3-TTS-12Hz-1.7B-Base
 ARG VOICE_DESIGN_ENABLED=false
