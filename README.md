@@ -21,7 +21,7 @@ Client ──HTTP / WebSocket──> FastAPI ──> runtime pool ──> Qwen3-
 ## Profiles
 
 - `web`: bundled browser UI, manual testing, runtime mode switching
-- `api`: API-first deployment, no bundled web UI
+- `api`: internal-only gateway backend, no bundled web UI
 
 ## Operations
 
@@ -47,4 +47,5 @@ Client ──HTTP / WebSocket──> FastAPI ──> runtime pool ──> Qwen3-
 
 ## Notes
 
+- In production, `tts --profile api` is intended to be consumed only through `ameego-gateway`.
 - The shared deployment contract lives in the `ameego-gateway/OPERATIONS.md` workspace doc.

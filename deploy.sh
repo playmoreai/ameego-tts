@@ -30,6 +30,7 @@ IMAGE_PROJECT="deeplearning-platform-release"
 SERVER_PORT="8080"
 HOST_HF_CACHE_DIR="/var/lib/ameego-tts/hf-cache"
 HOST_VOICE_STORE_DIR="/var/lib/ameego-tts/voice-store"
+GATEWAY_TAG="ameego-gateway"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -125,7 +126,7 @@ load_deploy_env() {
             key="${line%%=*}"
             value="${line#*=}"
             case "$key" in
-                DEPLOY_PROFILE|DEPLOY_ZONE|DEPLOY_INSTANCE_NAME|DEPLOY_FIREWALL_RULE|DEPLOY_SERVER_PORT|DEPLOY_MODEL_SIZE|DEPLOY_BUILD_PROFILE|DEPLOY_MODEL_SIZES|DEPLOY_DEFAULT_MODEL_SIZE|DEPLOY_INITIAL_MODEL_SIZE|DEPLOY_VOICE_DESIGN_ENABLED)
+                DEPLOY_PROFILE|DEPLOY_ZONE|DEPLOY_INSTANCE_NAME|DEPLOY_FIREWALL_RULE|DEPLOY_SERVER_PORT|DEPLOY_MODEL_SIZE|DEPLOY_BUILD_PROFILE|DEPLOY_MODEL_SIZES|DEPLOY_DEFAULT_MODEL_SIZE|DEPLOY_INITIAL_MODEL_SIZE|DEPLOY_VOICE_DESIGN_ENABLED|DEPLOY_INTERNAL_IP|DEPLOY_INTERNAL_BASE_URL|DEPLOY_SCHEME|DEPLOY_WS_SCHEME)
                     printf -v "$key" '%s' "$value"
                     ;;
             esac
@@ -152,6 +153,10 @@ save_deploy_env() {
         write_deploy_env_value "DEPLOY_INSTANCE_NAME" "${INSTANCE_NAME}"
         write_deploy_env_value "DEPLOY_FIREWALL_RULE" "${FIREWALL_RULE}"
         write_deploy_env_value "DEPLOY_SERVER_PORT" "${SERVER_PORT}"
+        write_deploy_env_value "DEPLOY_INTERNAL_IP" "${DEPLOY_INTERNAL_IP}"
+        write_deploy_env_value "DEPLOY_INTERNAL_BASE_URL" "http://${DEPLOY_INTERNAL_IP}:${SERVER_PORT}"
+        write_deploy_env_value "DEPLOY_SCHEME" "http"
+        write_deploy_env_value "DEPLOY_WS_SCHEME" "ws"
         write_deploy_env_value "DEPLOY_MODEL_SIZE" "${DEPLOY_MODEL_SIZE}"
         write_deploy_env_value "DEPLOY_BUILD_PROFILE" "${DEPLOY_BUILD_PROFILE}"
         write_deploy_env_value "DEPLOY_MODEL_SIZES" "${MODEL_SIZES}"
@@ -187,6 +192,12 @@ get_external_ip() {
     gcloud compute instances describe "$INSTANCE_NAME" \
         --zone="$ZONE" \
         --format='get(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null
+}
+
+get_internal_ip() {
+    gcloud compute instances describe "$INSTANCE_NAME" \
+        --zone="$ZONE" \
+        --format='get(networkInterfaces[0].networkIP)' 2>/dev/null
 }
 
 find_live_zone() {
@@ -364,6 +375,88 @@ other_profile_instance_exists() {
         | awk -v current="$INSTANCE_NAME" '$0 != current { print; exit }'
     )"
     [ -n "$other" ]
+}
+
+ssh_to_instance() {
+    local remote_command="${1:-}"
+    local -a args=("$INSTANCE_NAME" "--zone=$ZONE")
+    if [ "$PROFILE" = "api" ]; then
+        args+=("--tunnel-through-iap")
+    fi
+    if [ -n "$remote_command" ]; then
+        args+=("--command=$remote_command")
+    fi
+    gcloud compute ssh "${args[@]}"
+}
+
+wait_for_profile_ip() {
+    local ip=""
+    local fetch_cmd="get_external_ip"
+    if [ "$PROFILE" = "api" ]; then
+        fetch_cmd="get_internal_ip"
+    fi
+    for _ in $(seq 1 12); do
+        ip="$($fetch_cmd)"
+        if [ -n "$ip" ]; then
+            printf '%s\n' "$ip"
+            return 0
+        fi
+        sleep 5
+    done
+    return 1
+}
+
+wait_for_health() {
+    local ip="$1"
+    for _ in $(seq 1 120); do
+        if [ "$PROFILE" = "api" ]; then
+            if ssh_to_instance "curl -fsS http://127.0.0.1:${SERVER_PORT}/health >/dev/null" >/dev/null 2>&1; then
+                return 0
+            fi
+        else
+            if curl -sf "http://${ip}:${SERVER_PORT}/health" >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        printf "."
+        sleep 10
+    done
+    echo ""
+    return 1
+}
+
+maybe_register_gateway_backend() {
+    local internal_ip="$1"
+    [ "$PROFILE" = "api" ] || return 0
+    [ -n "${GATEWAY_ADMIN_URL:-}" ] || return 0
+    [ -n "${GATEWAY_ADMIN_TOKEN:-}" ] || return 0
+    local payload
+    payload=$(printf '{"service":"tts","profile":"api","internal_ip":"%s","port":%s,"scheme":"http","ws_scheme":"ws"}' "$internal_ip" "$SERVER_PORT")
+    curl -fsS --connect-timeout 3 --max-time 10 -X POST "${GATEWAY_ADMIN_URL%/}/admin/backends/register" \
+        -H "Authorization: Bearer ${GATEWAY_ADMIN_TOKEN}" \
+        -H "content-type: application/json" \
+        -d "$payload" >/dev/null 2>&1 || warn "Gateway registration failed for tts"
+}
+
+maybe_deregister_gateway_backend() {
+    [ "$PROFILE" = "api" ] || return 0
+    [ -n "${GATEWAY_ADMIN_URL:-}" ] || return 0
+    [ -n "${GATEWAY_ADMIN_TOKEN:-}" ] || return 0
+    curl -fsS --connect-timeout 3 --max-time 10 -X POST "${GATEWAY_ADMIN_URL%/}/admin/backends/deregister" \
+        -H "Authorization: Bearer ${GATEWAY_ADMIN_TOKEN}" \
+        -H "content-type: application/json" \
+        -d '{"service":"tts","profile":"api"}' >/dev/null 2>&1 || warn "Gateway deregistration failed for tts"
+}
+
+print_access_info() {
+    local ip="$1"
+    if [ "$PROFILE" = "web" ]; then
+        echo -e "  ${CYAN}Web UI:${NC}     http://${ip}:${SERVER_PORT}"
+    else
+        echo -e "  ${CYAN}API Base:${NC}   http://${ip}:${SERVER_PORT} (internal)"
+    fi
+    echo -e "  ${CYAN}WebSocket:${NC}  ws://${ip}:${SERVER_PORT}/ws/tts"
+    echo -e "  ${CYAN}Health:${NC}     http://${ip}:${SERVER_PORT}/health"
 }
 
 cmd_up() {
@@ -558,10 +651,13 @@ cmd_up() {
     fi
 
     log "Ensuring firewall rule..."
-    if gcloud compute firewall-rules describe "$FIREWALL_RULE" --quiet >/dev/null 2>&1; then
-        gcloud compute firewall-rules update "$FIREWALL_RULE" \
+    gcloud compute firewall-rules delete "$FIREWALL_RULE" --quiet >/dev/null 2>&1 || true
+    if [ "$PROFILE" = "api" ]; then
+        gcloud compute firewall-rules create "$FIREWALL_RULE" \
             --allow=tcp:${SERVER_PORT} \
             --target-tags="$INSTANCE_NAME" \
+            --source-tags="$GATEWAY_TAG" \
+            --description="Allow internal gateway access to Ameego TTS (${PROFILE})" \
             --quiet
     else
         gcloud compute firewall-rules create "$FIREWALL_RULE" \
@@ -640,74 +736,66 @@ echo 'Ameego TTS container started'
     startup_script_file="$(mktemp)"
     printf '%s\n' "$startup_script" > "$startup_script_file"
 
-    gcloud compute instances create "$INSTANCE_NAME" \
-        --zone="$ZONE" \
-        --machine-type="$MACHINE_TYPE" \
-        --image-family="$IMAGE_FAMILY" \
-        --image-project="$IMAGE_PROJECT" \
-        --boot-disk-size="$BOOT_DISK_SIZE" \
-        --boot-disk-type=pd-ssd \
-        --tags="$INSTANCE_NAME" \
-        --scopes=cloud-platform \
-        --maintenance-policy=TERMINATE \
-        --metadata-from-file="startup-script=${startup_script_file}" \
-        $spot_flag \
+    local -a create_args=(
+        --zone="$ZONE"
+        --machine-type="$MACHINE_TYPE"
+        --image-family="$IMAGE_FAMILY"
+        --image-project="$IMAGE_PROJECT"
+        --boot-disk-size="$BOOT_DISK_SIZE"
+        --boot-disk-type=pd-ssd
+        --tags="$INSTANCE_NAME"
+        --scopes=cloud-platform
+        --maintenance-policy=TERMINATE
+        --metadata-from-file="startup-script=${startup_script_file}"
         --quiet
+    )
+    if [ "$PROFILE" = "api" ]; then
+        create_args+=(--no-address)
+    fi
+    if [ -n "$spot_flag" ]; then
+        create_args+=("$spot_flag")
+    fi
+    gcloud compute instances create "$INSTANCE_NAME" "${create_args[@]}"
 
     rm -f "$startup_script_file"
-    save_deploy_env
 
     log "Waiting for instance to be ready..."
     sleep 10
 
     local ip=""
-    for _ in $(seq 1 12); do
-        ip="$(get_external_ip)"
-        if [ -n "$ip" ]; then
-            break
-        fi
-        sleep 5
-    done
+    ip="$(wait_for_profile_ip || true)"
+    DEPLOY_INTERNAL_IP="$(get_internal_ip || true)"
+    if [ -z "$DEPLOY_INTERNAL_IP" ]; then
+        DEPLOY_INTERNAL_IP="$ip"
+    fi
+    save_deploy_env
 
     if [ -z "$ip" ]; then
-        err "Could not get external IP"
+        err "Could not determine instance IP"
         exit 1
     fi
 
-    log "External IP: ${ip}"
+    maybe_register_gateway_backend "$DEPLOY_INTERNAL_IP"
+
+    if [ "$PROFILE" = "api" ]; then
+        log "Internal IP: ${ip}"
+    else
+        log "External IP: ${ip}"
+    fi
     if skip_health_check_enabled; then
         warn "Skipping health wait because SKIP_HEALTH_CHECK=true"
-        if [ "$PROFILE" = "web" ]; then
-            echo "  Web UI:    http://${ip}:${SERVER_PORT}"
-        fi
-        echo "  WebSocket: ws://${ip}:${SERVER_PORT}/ws/tts"
-        echo "  Health:    http://${ip}:${SERVER_PORT}/health"
+        print_access_info "$ip"
         return 0
     fi
     log "Waiting for server to be healthy (model loading may take a few minutes)..."
 
-    local healthy="false"
-    for _ in $(seq 1 120); do
-        if curl -sf "http://${ip}:${SERVER_PORT}/health" &>/dev/null; then
-            healthy="true"
-            break
-        fi
-        printf "."
-        sleep 10
-    done
-    echo ""
-
-    if [ "$healthy" = "true" ]; then
+    if wait_for_health "$ip"; then
         echo ""
         echo -e "${GREEN}╔══════════════════════════════════════╗${NC}"
         echo -e "${GREEN}║       Ameego TTS — Ready!            ║${NC}"
         echo -e "${GREEN}╚══════════════════════════════════════╝${NC}"
         echo ""
-        if [ "$PROFILE" = "web" ]; then
-            echo -e "  ${CYAN}Web UI:${NC}     http://${ip}:${SERVER_PORT}"
-        fi
-        echo -e "  ${CYAN}WebSocket:${NC}  ws://${ip}:${SERVER_PORT}/ws/tts"
-        echo -e "  ${CYAN}Health:${NC}     http://${ip}:${SERVER_PORT}/health"
+        print_access_info "$ip"
         echo ""
         echo -e "  ${CYAN}SSH:${NC}        ./deploy.sh ssh --profile ${PROFILE}"
         echo -e "  ${CYAN}Logs:${NC}       ./deploy.sh logs --profile ${PROFILE}"
@@ -739,6 +827,7 @@ cmd_down() {
     done
 
     prepare_instance_context "$requested_profile"
+    maybe_deregister_gateway_backend
 
     echo ""
     echo -e "${YELLOW}╔══════════════════════════════════════╗${NC}"
@@ -779,28 +868,30 @@ cmd_status() {
     echo ""
     gcloud compute instances describe "$INSTANCE_NAME" \
         --zone="$ZONE" \
-        --format="table(name, status, networkInterfaces[0].accessConfigs[0].natIP, machineType.basename())" 2>/dev/null || {
+        --format="table(name, status, networkInterfaces[0].networkIP, networkInterfaces[0].accessConfigs[0].natIP, machineType.basename())" 2>/dev/null || {
         warn "Instance not found"
         return 1
     }
 
-    local ip
-    ip="$(get_external_ip)"
+    local ip=""
+    if [ "$PROFILE" = "api" ]; then
+        ip="${DEPLOY_INTERNAL_IP:-}"
+        [ -n "$ip" ] || ip="$(get_internal_ip)"
+    else
+        ip="$(get_external_ip)"
+    fi
     if [ -n "$ip" ]; then
         echo ""
         echo "  Profile:   ${PROFILE}"
         echo "  Build:     ${DEPLOY_BUILD_PROFILE:-$(default_build_profile_for_profile "$PROFILE")}"
-        if curl -sf "http://${ip}:${SERVER_PORT}/health" 2>/dev/null; then
+        if wait_for_health "$ip" >/dev/null 2>&1; then
             echo ""
             log "Health: ${GREEN}OK${NC}"
         else
             warn "Health: NOT READY (model may still be loading)"
         fi
         echo ""
-        if [ "$PROFILE" = "web" ]; then
-            echo "  Web UI:    http://${ip}:${SERVER_PORT}"
-        fi
-        echo "  WebSocket: ws://${ip}:${SERVER_PORT}/ws/tts"
+        print_access_info "$ip"
     fi
 }
 
@@ -818,7 +909,7 @@ cmd_ssh() {
     done
 
     prepare_instance_context "$requested_profile"
-    gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE"
+    ssh_to_instance
 }
 
 cmd_logs() {
@@ -835,8 +926,7 @@ cmd_logs() {
     done
 
     prepare_instance_context "$requested_profile"
-    gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" \
-        --command="docker logs --tail 100 -f ${CONTAINER_NAME} 2>&1"
+    ssh_to_instance "docker logs --tail 100 -f ${CONTAINER_NAME} 2>&1"
 }
 
 cmd_url() {
@@ -854,8 +944,13 @@ cmd_url() {
 
     prepare_instance_context "$requested_profile"
 
-    local ip
-    ip="$(get_external_ip)"
+    local ip=""
+    if [ "$PROFILE" = "api" ]; then
+        ip="${DEPLOY_INTERNAL_IP:-}"
+        [ -n "$ip" ] || ip="$(get_internal_ip)"
+    else
+        ip="$(get_external_ip)"
+    fi
     if [ -n "$ip" ]; then
         echo "http://${ip}:${SERVER_PORT}"
     else
