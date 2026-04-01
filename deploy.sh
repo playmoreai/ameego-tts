@@ -1,26 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-# ============================================================
-# Ameego TTS — GCE GPU Deploy Script
-# Usage:
-#   ./deploy.sh up [--model 0.6B|1.7B] [--profile test|api] [--build full|fast] [--spot] [--zone ZONE]
-#   ./deploy.sh down
-#   ./deploy.sh status
-#   ./deploy.sh ssh
-#   ./deploy.sh logs
-#   ./deploy.sh url
-# ============================================================
-
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEPLOY_ENV="${SCRIPT_DIR}/.deploy.env"
 
-# Defaults
-INSTANCE_NAME="ameego-tts"
+ENGINE_NAME="ameego-tts"
+CONTAINER_NAME="ameego-tts"
+REPO_NAME="ameego-tts"
+DEFAULT_PROFILE="web"
 DEFAULT_ZONE="asia-northeast3-a"
 DEFAULT_MODEL="1.7B"
-DEFAULT_APP_PROFILE="test"
-DEFAULT_BUILD_PROFILE_TEST="full"
+DEFAULT_BUILD_PROFILE_WEB="full"
 DEFAULT_BUILD_PROFILE_API="fast"
 DEFAULT_MODEL_SIZES="1.7B"
 DEFAULT_MODEL_ID_0_6B="Qwen/Qwen3-TTS-12Hz-0.6B-Base"
@@ -37,12 +27,10 @@ MACHINE_TYPE="g2-standard-4"
 BOOT_DISK_SIZE="100GB"
 IMAGE_FAMILY="common-cu128-ubuntu-2204-nvidia-570"
 IMAGE_PROJECT="deeplearning-platform-release"
-FIREWALL_RULE="ameego-tts-allow-http"
 SERVER_PORT="8080"
 HOST_HF_CACHE_DIR="/var/lib/ameego-tts/hf-cache"
 HOST_VOICE_STORE_DIR="/var/lib/ameego-tts/voice-store"
 
-# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -53,49 +41,143 @@ log()  { echo -e "${GREEN}[+]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 err()  { echo -e "${RED}[x]${NC} $*" >&2; }
 
-# ---- Helpers ------------------------------------------------
+PROFILE="$DEFAULT_PROFILE"
+PROFILE_TITLE="Web"
+RUNTIME_APP_PROFILE="test"
+INSTANCE_NAME="${ENGINE_NAME}-web"
+FIREWALL_RULE="${ENGINE_NAME}-web-allow-http"
+PROJECT_ID=""
+ZONE="$DEFAULT_ZONE"
 
-load_deploy_env() {
-    if [ -f "$DEPLOY_ENV" ]; then
-        source "$DEPLOY_ENV"
-    fi
-}
+usage() {
+    cat <<EOF
+Usage: $0 {up|down|status|ssh|logs|url} [options]
 
-save_deploy_env() {
-    cat > "$DEPLOY_ENV" <<EOF
-APP_PROFILE=${APP_PROFILE:-$DEFAULT_APP_PROFILE}
-BUILD_PROFILE=${BUILD_PROFILE:-}
-ZONE=${ZONE}
-MODEL_SIZES=${MODEL_SIZES}
-DEFAULT_MODEL_SIZE=${DEFAULT_MODEL_SIZE}
-INITIAL_CLONE_MODEL_SIZE=${INITIAL_CLONE_MODEL_SIZE}
-CLONE_0_6B_REPLICAS=${CLONE_0_6B_REPLICAS:-$DEFAULT_CLONE_0_6B_REPLICAS}
-CLONE_1_7B_REPLICAS=${CLONE_1_7B_REPLICAS:-$DEFAULT_CLONE_1_7B_REPLICAS}
-VOICE_DESIGN_REPLICAS=${VOICE_DESIGN_REPLICAS:-$DEFAULT_VOICE_DESIGN_REPLICAS}
-VOICE_DESIGN_ENABLED=${VOICE_DESIGN_ENABLED:-false}
-MODEL_ID_0_6B=${MODEL_ID_0_6B:-$DEFAULT_MODEL_ID_0_6B}
-MODEL_ID_1_7B=${MODEL_ID_1_7B:-$DEFAULT_MODEL_ID_1_7B}
-VOICE_DESIGN_MODEL_ID=${VOICE_DESIGN_MODEL_ID:-$DEFAULT_VOICE_DESIGN_MODEL_ID}
-ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-$DEFAULT_ALLOWED_ORIGINS}
-MAX_CONNECTIONS=${MAX_CONNECTIONS:-$DEFAULT_MAX_CONNECTIONS}
-MAX_WAITING_SYNTH_REQUESTS=${MAX_WAITING_SYNTH_REQUESTS:-$DEFAULT_MAX_WAITING_SYNTH_REQUESTS}
-VOICE_STORAGE_DIR=${VOICE_STORAGE_DIR:-/data/voices}
-MODEL_DEVICE=${MODEL_DEVICE:-cuda}
-MODEL_DTYPE=${MODEL_DTYPE:-bfloat16}
-ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION:-sdpa}
-CUDA_GRAPH_MAX_SEQ_LEN=${CUDA_GRAPH_MAX_SEQ_LEN:-2048}
-CHUNK_SIZE=${CHUNK_SIZE:-2}
-MAX_TEXT_LENGTH=${MAX_TEXT_LENGTH:-5000}
-CLONE_PROMPT_CACHE_SIZE=${CLONE_PROMPT_CACHE_SIZE:-32}
-PROJECT_ID=${PROJECT_ID}
-INSTANCE_NAME=${INSTANCE_NAME}
-SERVER_PORT=${SERVER_PORT}
+Commands:
+  up                       Deploy the selected profile
+  down                     Destroy the selected profile
+  status                   Show status for the selected profile
+  ssh                      SSH into the selected profile VM
+  logs                     View logs for the selected profile
+  url                      Print the selected profile URL
+
+Profile selection:
+  --profile web|api        Select the deployment profile
+
+Options for 'up':
+  --model 0.6B|1.7B
+  --build full|fast
+  --spot
+  --zone ZONE
+
+Examples:
+  $0 up --profile web
+  $0 up --profile api --build fast
+  $0 status --profile api
 EOF
 }
 
+normalize_profile() {
+    case "${1:-}" in
+        web|api) echo "$1" ;;
+        *)
+            err "Invalid profile value: ${1:-}. Allowed: web, api"
+            exit 1
+            ;;
+    esac
+}
+
+skip_health_check_enabled() {
+    case "${SKIP_HEALTH_CHECK:-false}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+set_profile_context() {
+    PROFILE="$(normalize_profile "${1:-$DEFAULT_PROFILE}")"
+    case "$PROFILE" in
+        web)
+            PROFILE_TITLE="Web"
+            RUNTIME_APP_PROFILE="test"
+            INSTANCE_NAME="${ENGINE_NAME}-web"
+            FIREWALL_RULE="${ENGINE_NAME}-web-allow-http"
+            ;;
+        api)
+            PROFILE_TITLE="API"
+            RUNTIME_APP_PROFILE="api"
+            INSTANCE_NAME="${ENGINE_NAME}-api"
+            FIREWALL_RULE="${ENGINE_NAME}-api-allow-http"
+            ;;
+    esac
+}
+
+load_deploy_env() {
+    if [ -f "$DEPLOY_ENV" ]; then
+        local line=""
+        local key=""
+        local value=""
+        while IFS= read -r line || [ -n "$line" ]; do
+            [ -z "$line" ] && continue
+            case "$line" in
+                \#*) continue ;;
+            esac
+            key="${line%%=*}"
+            value="${line#*=}"
+            case "$key" in
+                DEPLOY_PROFILE|DEPLOY_ZONE|DEPLOY_INSTANCE_NAME|DEPLOY_FIREWALL_RULE|DEPLOY_SERVER_PORT|DEPLOY_MODEL_SIZE|DEPLOY_BUILD_PROFILE|DEPLOY_MODEL_SIZES|DEPLOY_DEFAULT_MODEL_SIZE|DEPLOY_INITIAL_MODEL_SIZE|DEPLOY_VOICE_DESIGN_ENABLED)
+                    printf -v "$key" '%s' "$value"
+                    ;;
+            esac
+        done < "$DEPLOY_ENV"
+    fi
+}
+
+write_deploy_env_value() {
+    local key="$1"
+    local value="$2"
+    case "$value" in
+        *$'\n'*|*$'\r'*)
+            err "${key} cannot contain newlines"
+            exit 1
+            ;;
+    esac
+    printf '%s=%s\n' "$key" "$value"
+}
+
+save_deploy_env() {
+    {
+        write_deploy_env_value "DEPLOY_PROFILE" "${PROFILE}"
+        write_deploy_env_value "DEPLOY_ZONE" "${ZONE}"
+        write_deploy_env_value "DEPLOY_INSTANCE_NAME" "${INSTANCE_NAME}"
+        write_deploy_env_value "DEPLOY_FIREWALL_RULE" "${FIREWALL_RULE}"
+        write_deploy_env_value "DEPLOY_SERVER_PORT" "${SERVER_PORT}"
+        write_deploy_env_value "DEPLOY_MODEL_SIZE" "${DEPLOY_MODEL_SIZE}"
+        write_deploy_env_value "DEPLOY_BUILD_PROFILE" "${DEPLOY_BUILD_PROFILE}"
+        write_deploy_env_value "DEPLOY_MODEL_SIZES" "${MODEL_SIZES}"
+        write_deploy_env_value "DEPLOY_DEFAULT_MODEL_SIZE" "${DEFAULT_MODEL_SIZE}"
+        write_deploy_env_value "DEPLOY_INITIAL_MODEL_SIZE" "${INITIAL_CLONE_MODEL_SIZE}"
+        write_deploy_env_value "DEPLOY_VOICE_DESIGN_ENABLED" "${VOICE_DESIGN_ENABLED}"
+    } > "$DEPLOY_ENV"
+}
+
+resolve_profile() {
+    local requested_profile="${1:-}"
+    load_deploy_env
+    if [ -n "$requested_profile" ]; then
+        set_profile_context "$requested_profile"
+        return
+    fi
+    if [ -n "${DEPLOY_PROFILE:-}" ]; then
+        set_profile_context "$DEPLOY_PROFILE"
+        return
+    fi
+    set_profile_context "$DEFAULT_PROFILE"
+}
+
 get_project_id() {
-    PROJECT_ID=$(gcloud config get-value project 2>/dev/null)
-    if [ -z "$PROJECT_ID" ]; then
+    PROJECT_ID="$(gcloud config get-value project 2>/dev/null)"
+    if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" = "(unset)" ]; then
         err "No GCP project set. Run: gcloud config set project <PROJECT_ID>"
         exit 1
     fi
@@ -105,6 +187,26 @@ get_external_ip() {
     gcloud compute instances describe "$INSTANCE_NAME" \
         --zone="$ZONE" \
         --format='get(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null
+}
+
+find_live_zone() {
+    gcloud compute instances list \
+        --filter="name=${INSTANCE_NAME}" \
+        --format='value(zone)' 2>/dev/null \
+    | head -n1
+}
+
+prepare_instance_context() {
+    local requested_profile="${1:-}"
+    resolve_profile "$requested_profile"
+    check_prerequisites
+
+    if [ -n "${DEPLOY_ZONE:-}" ] && [ "${DEPLOY_PROFILE:-}" = "$PROFILE" ]; then
+        ZONE="${DEPLOY_ZONE}"
+    else
+        ZONE="$(find_live_zone || true)"
+        ZONE="${ZONE:-$DEFAULT_ZONE}"
+    fi
 }
 
 build_docker_env_args() {
@@ -180,25 +282,12 @@ normalize_bool() {
     esac
 }
 
-normalize_profile() {
-    case "${1:-}" in
-        test|api) echo "$1" ;;
-        "")
-            echo "$DEFAULT_APP_PROFILE"
-            ;;
-        *)
-            err "Invalid profile value: $1. Allowed: test, api"
-            exit 1
-            ;;
-    esac
-}
-
-default_build_profile_for_app_profile() {
+default_build_profile_for_profile() {
     case "$1" in
-        test) echo "$DEFAULT_BUILD_PROFILE_TEST" ;;
+        web) echo "$DEFAULT_BUILD_PROFILE_WEB" ;;
         api) echo "$DEFAULT_BUILD_PROFILE_API" ;;
         *)
-            err "Unsupported app profile for build default: $1"
+            err "Unsupported profile for build default: $1"
             exit 1
             ;;
     esac
@@ -263,126 +352,151 @@ check_prerequisites() {
     fi
 
     get_project_id
-    log "Project: ${PROJECT_ID}"
+    log "Project: ${PROJECT_ID}" >&2
 }
 
-# ---- Commands -----------------------------------------------
+other_profile_instance_exists() {
+    local other=""
+    other="$(
+        gcloud compute instances list \
+            --filter='name~"^ameego-tts-(web|api)$"' \
+            --format='value(name)' 2>/dev/null \
+        | awk -v current="$INSTANCE_NAME" '$0 != current { print; exit }'
+    )"
+    [ -n "$other" ]
+}
 
 cmd_up() {
-    local MODEL_SIZE="${MODEL_SIZE:-}"
-    local APP_PROFILE_TO_USE="${APP_PROFILE:-$DEFAULT_APP_PROFILE}"
-    local BUILD_PROFILE_TO_USE="${BUILD_PROFILE:-}"
-    local ZONE="$DEFAULT_ZONE"
-    local SPOT_FLAG=""
-    local SKIP_BUILD_FLAG
-    SKIP_BUILD_FLAG="$(normalize_bool "${SKIP_BUILD:-false}")"
+    local requested_profile=""
+    local model_size="${MODEL_SIZE:-}"
+    local build_profile_to_use="${BUILD_PROFILE:-}"
+    local requested_zone="$DEFAULT_ZONE"
+    local spot_flag=""
+    local skip_build_flag
+    skip_build_flag="$(normalize_bool "${SKIP_BUILD:-false}")"
 
-    # Parse args
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --model)  MODEL_SIZE="$2"; shift 2 ;;
-            --profile) APP_PROFILE_TO_USE="$2"; shift 2 ;;
-            --build) BUILD_PROFILE_TO_USE="$2"; shift 2 ;;
-            --spot)   SPOT_FLAG="--provisioning-model=SPOT"; shift ;;
-            --zone)   ZONE="$2"; shift 2 ;;
-            *)        err "Unknown option: $1"; exit 1 ;;
+            --profile) requested_profile="$2"; shift 2 ;;
+            --model) model_size="$2"; shift 2 ;;
+            --build) build_profile_to_use="$2"; shift 2 ;;
+            --spot) spot_flag="--provisioning-model=SPOT"; shift ;;
+            --zone) requested_zone="$2"; shift 2 ;;
+            *)
+                err "Unknown option: $1"
+                usage
+                exit 1
+                ;;
         esac
     done
 
+    if [ -z "$requested_profile" ]; then
+        err "'up' requires --profile web|api"
+        exit 1
+    fi
+
+    set_profile_context "$requested_profile"
+    ZONE="$requested_zone"
     check_prerequisites
-    APP_PROFILE_TO_USE="$(normalize_profile "$APP_PROFILE_TO_USE")"
-    if [ -z "$MODEL_SIZE" ]; then
-        MODEL_SIZE="$DEFAULT_MODEL"
-    fi
-    if [ -z "$BUILD_PROFILE_TO_USE" ]; then
-        BUILD_PROFILE_TO_USE="$(default_build_profile_for_app_profile "$APP_PROFILE_TO_USE")"
-    fi
-    BUILD_PROFILE_TO_USE="$(normalize_build_profile "$BUILD_PROFILE_TO_USE")"
 
-    local REGION="${ZONE%-*}"
-    local REPO_NAME="ameego-tts"
-    local REGISTRY="${REGION}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}"
-    local MODEL_SIZES_TO_LOAD
+    if other_profile_instance_exists; then
+        err "Another TTS profile is already deployed. Run './deploy.sh down --profile web' or './deploy.sh down --profile api' first."
+        exit 1
+    fi
+
+    if [ -z "$model_size" ]; then
+        model_size="$DEFAULT_MODEL"
+    fi
+    if [ -z "$build_profile_to_use" ]; then
+        build_profile_to_use="$(default_build_profile_for_profile "$PROFILE")"
+    fi
+    build_profile_to_use="$(normalize_build_profile "$build_profile_to_use")"
+
+    local region="${ZONE%-*}"
+    local registry="${region}-docker.pkg.dev/${PROJECT_ID}/${REPO_NAME}"
+    local model_sizes_to_load=""
     if [ "${MODEL_SIZES+x}" = "x" ] && [ -n "${MODEL_SIZES}" ]; then
-        MODEL_SIZES_TO_LOAD="${MODEL_SIZES}"
-    elif [ "$APP_PROFILE_TO_USE" = "api" ]; then
-        MODEL_SIZES_TO_LOAD="${MODEL_SIZE}"
+        model_sizes_to_load="${MODEL_SIZES}"
+    elif [ "$PROFILE" = "api" ]; then
+        model_sizes_to_load="${model_size}"
     else
-        MODEL_SIZES_TO_LOAD="${DEFAULT_MODEL_SIZES}"
+        model_sizes_to_load="${DEFAULT_MODEL_SIZES}"
     fi
-    local DEFAULT_MODEL_SIZE_TO_USE="${DEFAULT_MODEL_SIZE:-$MODEL_SIZE}"
-    local INITIAL_CLONE_MODEL_SIZE_TO_USE="${INITIAL_CLONE_MODEL_SIZE:-$DEFAULT_MODEL_SIZE_TO_USE}"
-    local MODEL_ID_0_6B_TO_USE="${MODEL_ID_0_6B:-$DEFAULT_MODEL_ID_0_6B}"
-    local MODEL_ID_1_7B_TO_USE="${MODEL_ID_1_7B:-$DEFAULT_MODEL_ID_1_7B}"
-    local CLONE_0_6B_REPLICAS_TO_USE="${CLONE_0_6B_REPLICAS:-$DEFAULT_CLONE_0_6B_REPLICAS}"
-    local CLONE_1_7B_REPLICAS_TO_USE="${CLONE_1_7B_REPLICAS:-$DEFAULT_CLONE_1_7B_REPLICAS}"
-    local VOICE_DESIGN_ENABLED_TO_USE
-    VOICE_DESIGN_ENABLED_TO_USE="$(normalize_bool "${VOICE_DESIGN_ENABLED:-$DEFAULT_VOICE_DESIGN_ENABLED}")"
-    local VOICE_DESIGN_MODEL_ID_TO_USE="${VOICE_DESIGN_MODEL_ID:-$DEFAULT_VOICE_DESIGN_MODEL_ID}"
-    local VOICE_DESIGN_REPLICAS_TO_USE="${VOICE_DESIGN_REPLICAS:-$DEFAULT_VOICE_DESIGN_REPLICAS}"
-    local ALLOWED_ORIGINS_TO_USE="${ALLOWED_ORIGINS:-$DEFAULT_ALLOWED_ORIGINS}"
-    local MAX_CONNECTIONS_TO_USE="${MAX_CONNECTIONS:-$DEFAULT_MAX_CONNECTIONS}"
-    local MAX_WAITING_SYNTH_REQUESTS_TO_USE="${MAX_WAITING_SYNTH_REQUESTS:-$DEFAULT_MAX_WAITING_SYNTH_REQUESTS}"
-    local VOICE_STORAGE_DIR_TO_USE="${VOICE_STORAGE_DIR:-/data/voices}"
-    MODEL_SIZES_TO_LOAD="$(normalize_model_sizes_csv "$MODEL_SIZES_TO_LOAD")"
-    validate_model_id "MODEL_ID_0_6B" "$MODEL_ID_0_6B_TO_USE"
-    validate_model_id "MODEL_ID_1_7B" "$MODEL_ID_1_7B_TO_USE"
-    validate_model_id "VOICE_DESIGN_MODEL_ID" "$VOICE_DESIGN_MODEL_ID_TO_USE"
-    validate_positive_int "CLONE_0_6B_REPLICAS" "$CLONE_0_6B_REPLICAS_TO_USE"
-    validate_positive_int "CLONE_1_7B_REPLICAS" "$CLONE_1_7B_REPLICAS_TO_USE"
-    validate_positive_int "VOICE_DESIGN_REPLICAS" "$VOICE_DESIGN_REPLICAS_TO_USE"
-    validate_positive_int "MAX_CONNECTIONS" "$MAX_CONNECTIONS_TO_USE"
-    case "$MAX_WAITING_SYNTH_REQUESTS_TO_USE" in
+    local default_model_size_to_use="${DEFAULT_MODEL_SIZE:-$model_size}"
+    local initial_clone_model_size_to_use="${INITIAL_CLONE_MODEL_SIZE:-$default_model_size_to_use}"
+    local model_id_0_6b_to_use="${MODEL_ID_0_6B:-$DEFAULT_MODEL_ID_0_6B}"
+    local model_id_1_7b_to_use="${MODEL_ID_1_7B:-$DEFAULT_MODEL_ID_1_7B}"
+    local clone_0_6b_replicas_to_use="${CLONE_0_6B_REPLICAS:-$DEFAULT_CLONE_0_6B_REPLICAS}"
+    local clone_1_7b_replicas_to_use="${CLONE_1_7B_REPLICAS:-$DEFAULT_CLONE_1_7B_REPLICAS}"
+    local voice_design_enabled_to_use
+    voice_design_enabled_to_use="$(normalize_bool "${VOICE_DESIGN_ENABLED:-$DEFAULT_VOICE_DESIGN_ENABLED}")"
+    local voice_design_model_id_to_use="${VOICE_DESIGN_MODEL_ID:-$DEFAULT_VOICE_DESIGN_MODEL_ID}"
+    local voice_design_replicas_to_use="${VOICE_DESIGN_REPLICAS:-$DEFAULT_VOICE_DESIGN_REPLICAS}"
+    local allowed_origins_to_use="${ALLOWED_ORIGINS:-$DEFAULT_ALLOWED_ORIGINS}"
+    local max_connections_to_use="${MAX_CONNECTIONS:-$DEFAULT_MAX_CONNECTIONS}"
+    local max_waiting_synth_requests_to_use="${MAX_WAITING_SYNTH_REQUESTS:-$DEFAULT_MAX_WAITING_SYNTH_REQUESTS}"
+    local voice_storage_dir_to_use="${VOICE_STORAGE_DIR:-/data/voices}"
+    model_sizes_to_load="$(normalize_model_sizes_csv "$model_sizes_to_load")"
+    validate_model_id "MODEL_ID_0_6B" "$model_id_0_6b_to_use"
+    validate_model_id "MODEL_ID_1_7B" "$model_id_1_7b_to_use"
+    validate_model_id "VOICE_DESIGN_MODEL_ID" "$voice_design_model_id_to_use"
+    validate_positive_int "CLONE_0_6B_REPLICAS" "$clone_0_6b_replicas_to_use"
+    validate_positive_int "CLONE_1_7B_REPLICAS" "$clone_1_7b_replicas_to_use"
+    validate_positive_int "VOICE_DESIGN_REPLICAS" "$voice_design_replicas_to_use"
+    validate_positive_int "MAX_CONNECTIONS" "$max_connections_to_use"
+    case "$max_waiting_synth_requests_to_use" in
         ''|*[!0-9]*)
-            err "MAX_WAITING_SYNTH_REQUESTS must be >= 0: ${MAX_WAITING_SYNTH_REQUESTS_TO_USE}"
+            err "MAX_WAITING_SYNTH_REQUESTS must be >= 0: ${max_waiting_synth_requests_to_use}"
             exit 1
             ;;
     esac
-    local IMAGE_TAG
-    IMAGE_TAG="$(compute_image_tag \
-        "$REGISTRY" \
-        "$DEFAULT_MODEL_SIZE_TO_USE" \
-        "$BUILD_PROFILE_TO_USE" \
-        "$MODEL_SIZES_TO_LOAD" \
-        "$MODEL_ID_0_6B_TO_USE" \
-        "$MODEL_ID_1_7B_TO_USE" \
-        "$VOICE_DESIGN_ENABLED_TO_USE" \
-        "$VOICE_DESIGN_MODEL_ID_TO_USE")"
+    local image_tag
+    image_tag="$(compute_image_tag \
+        "$registry" \
+        "$default_model_size_to_use" \
+        "$build_profile_to_use" \
+        "$model_sizes_to_load" \
+        "$model_id_0_6b_to_use" \
+        "$model_id_1_7b_to_use" \
+        "$voice_design_enabled_to_use" \
+        "$voice_design_model_id_to_use")"
 
-    case ",${MODEL_SIZES_TO_LOAD}," in
-        *",${DEFAULT_MODEL_SIZE_TO_USE},"*) ;;
+    case ",${model_sizes_to_load}," in
+        *",${default_model_size_to_use},"*) ;;
         *)
-            err "DEFAULT_MODEL_SIZE=${DEFAULT_MODEL_SIZE_TO_USE} must be included in MODEL_SIZES=${MODEL_SIZES_TO_LOAD}"
+            err "DEFAULT_MODEL_SIZE=${default_model_size_to_use} must be included in MODEL_SIZES=${model_sizes_to_load}"
             exit 1
             ;;
     esac
-    case ",${MODEL_SIZES_TO_LOAD}," in
-        *",${INITIAL_CLONE_MODEL_SIZE_TO_USE},"*) ;;
+    case ",${model_sizes_to_load}," in
+        *",${initial_clone_model_size_to_use},"*) ;;
         *)
-            err "INITIAL_CLONE_MODEL_SIZE=${INITIAL_CLONE_MODEL_SIZE_TO_USE} must be included in MODEL_SIZES=${MODEL_SIZES_TO_LOAD}"
+            err "INITIAL_CLONE_MODEL_SIZE=${initial_clone_model_size_to_use} must be included in MODEL_SIZES=${model_sizes_to_load}"
             exit 1
             ;;
     esac
 
-    MODEL_SIZES="${MODEL_SIZES_TO_LOAD}"
-    APP_PROFILE="${APP_PROFILE_TO_USE}"
-    BUILD_PROFILE="${BUILD_PROFILE_TO_USE}"
-    DEFAULT_MODEL_SIZE="${DEFAULT_MODEL_SIZE_TO_USE}"
-    INITIAL_CLONE_MODEL_SIZE="${INITIAL_CLONE_MODEL_SIZE_TO_USE}"
-    MODEL_ID_0_6B="${MODEL_ID_0_6B_TO_USE}"
-    MODEL_ID_1_7B="${MODEL_ID_1_7B_TO_USE}"
-    CLONE_0_6B_REPLICAS="${CLONE_0_6B_REPLICAS_TO_USE}"
-    CLONE_1_7B_REPLICAS="${CLONE_1_7B_REPLICAS_TO_USE}"
-    VOICE_DESIGN_ENABLED="${VOICE_DESIGN_ENABLED_TO_USE}"
-    VOICE_DESIGN_MODEL_ID="${VOICE_DESIGN_MODEL_ID_TO_USE}"
-    VOICE_DESIGN_REPLICAS="${VOICE_DESIGN_REPLICAS_TO_USE}"
-    ALLOWED_ORIGINS="${ALLOWED_ORIGINS_TO_USE}"
-    MAX_CONNECTIONS="${MAX_CONNECTIONS_TO_USE}"
-    MAX_WAITING_SYNTH_REQUESTS="${MAX_WAITING_SYNTH_REQUESTS_TO_USE}"
-    VOICE_STORAGE_DIR="${VOICE_STORAGE_DIR_TO_USE}"
+    MODEL_SIZES="${model_sizes_to_load}"
+    APP_PROFILE="${RUNTIME_APP_PROFILE}"
+    BUILD_PROFILE="${build_profile_to_use}"
+    DEFAULT_MODEL_SIZE="${default_model_size_to_use}"
+    INITIAL_CLONE_MODEL_SIZE="${initial_clone_model_size_to_use}"
+    MODEL_ID_0_6B="${model_id_0_6b_to_use}"
+    MODEL_ID_1_7B="${model_id_1_7b_to_use}"
+    CLONE_0_6B_REPLICAS="${clone_0_6b_replicas_to_use}"
+    CLONE_1_7B_REPLICAS="${clone_1_7b_replicas_to_use}"
+    VOICE_DESIGN_ENABLED="${voice_design_enabled_to_use}"
+    VOICE_DESIGN_MODEL_ID="${voice_design_model_id_to_use}"
+    VOICE_DESIGN_REPLICAS="${voice_design_replicas_to_use}"
+    ALLOWED_ORIGINS="${allowed_origins_to_use}"
+    MAX_CONNECTIONS="${max_connections_to_use}"
+    MAX_WAITING_SYNTH_REQUESTS="${max_waiting_synth_requests_to_use}"
+    VOICE_STORAGE_DIR="${voice_storage_dir_to_use}"
+    DEPLOY_MODEL_SIZE="${model_size}"
+    DEPLOY_BUILD_PROFILE="${build_profile_to_use}"
 
-    local DOCKER_ENV_ARGS
-    DOCKER_ENV_ARGS="$(
+    local docker_env_args
+    docker_env_args="$(
         build_docker_env_args \
             APP_PROFILE \
             MODEL_SIZES \
@@ -415,38 +529,34 @@ cmd_up() {
     echo -e "${CYAN}║       Ameego TTS — Deploying         ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
     echo ""
-    echo "  Profile:  ${APP_PROFILE_TO_USE}"
-    echo "  Build:    ${BUILD_PROFILE_TO_USE}"
-    echo "  Default:  Qwen3-TTS-${DEFAULT_MODEL_SIZE_TO_USE}"
-    echo "  Initial:  Qwen3-TTS-${INITIAL_CLONE_MODEL_SIZE_TO_USE}"
-    echo "  Load:     ${MODEL_SIZES_TO_LOAD}"
-    echo "  Voice Design: ${VOICE_DESIGN_ENABLED_TO_USE}"
+    echo "  Profile:  ${PROFILE}"
+    echo "  Build:    ${build_profile_to_use}"
+    echo "  Default:  Qwen3-TTS-${default_model_size_to_use}"
+    echo "  Initial:  Qwen3-TTS-${initial_clone_model_size_to_use}"
+    echo "  Load:     ${model_sizes_to_load}"
+    echo "  Voice Design: ${voice_design_enabled_to_use}"
     echo "  Machine:  ${MACHINE_TYPE}"
     echo "  Zone:     ${ZONE}"
-    echo "  Spot:     ${SPOT_FLAG:-no}"
+    echo "  Spot:     ${spot_flag:-no}"
     echo ""
 
-    # 1. Create Artifact Registry repo
     log "Ensuring Artifact Registry repository..."
     gcloud artifacts repositories create "$REPO_NAME" \
         --repository-format=docker \
-        --location="$REGION" \
+        --location="$region" \
         --quiet 2>/dev/null || true
 
-    # 2. Build and push Docker image via Cloud Build
-    if [ "$SKIP_BUILD_FLAG" = "true" ]; then
-        log "Skipping image build and reusing: ${IMAGE_TAG}"
+    if [ "$skip_build_flag" = "true" ]; then
+        log "Skipping image build and reusing: ${image_tag}"
     else
         log "Building Docker image via Cloud Build (this may take 15-30 minutes)..."
         gcloud builds submit "$SCRIPT_DIR" \
             --config="${SCRIPT_DIR}/cloudbuild.yaml" \
-            --substitutions="_BUILD_PROFILE=${BUILD_PROFILE_TO_USE},_MODEL_SIZES=${MODEL_SIZES_TO_LOAD//,/%2C},_MODEL_ID_0_6B=${MODEL_ID_0_6B_TO_USE},_MODEL_ID_1_7B=${MODEL_ID_1_7B_TO_USE},_VOICE_DESIGN_ENABLED=${VOICE_DESIGN_ENABLED_TO_USE},_VOICE_DESIGN_MODEL_ID=${VOICE_DESIGN_MODEL_ID_TO_USE},_IMAGE_TAG=${IMAGE_TAG}" \
+            --substitutions="_BUILD_PROFILE=${build_profile_to_use},_MODEL_SIZES=${model_sizes_to_load//,/%2C},_MODEL_ID_0_6B=${model_id_0_6b_to_use},_MODEL_ID_1_7B=${model_id_1_7b_to_use},_VOICE_DESIGN_ENABLED=${voice_design_enabled_to_use},_VOICE_DESIGN_MODEL_ID=${voice_design_model_id_to_use},_IMAGE_TAG=${image_tag}" \
             --quiet
-
-        log "Image pushed: ${IMAGE_TAG}"
+        log "Image pushed: ${image_tag}"
     fi
 
-    # 3. Create firewall rule
     log "Ensuring firewall rule..."
     if gcloud compute firewall-rules describe "$FIREWALL_RULE" --quiet >/dev/null 2>&1; then
         gcloud compute firewall-rules update "$FIREWALL_RULE" \
@@ -457,24 +567,27 @@ cmd_up() {
         gcloud compute firewall-rules create "$FIREWALL_RULE" \
             --allow=tcp:${SERVER_PORT} \
             --target-tags="$INSTANCE_NAME" \
-            --description="Allow HTTP access to Ameego TTS" \
+            --description="Allow HTTP access to Ameego TTS (${PROFILE})" \
             --quiet
     fi
 
-    # 4. Create GCE VM with GPU
+    if gcloud compute instances describe "$INSTANCE_NAME" --zone="$ZONE" &>/dev/null; then
+        err "Instance '${INSTANCE_NAME}' already exists in ${ZONE}. Run './deploy.sh down --profile ${PROFILE}' first."
+        exit 1
+    fi
+
     log "Creating GCE instance: ${INSTANCE_NAME} in ${ZONE}..."
 
-    local CACHE_VOLUME_ARG=""
-    if [ "$BUILD_PROFILE_TO_USE" = "fast" ]; then
-        CACHE_VOLUME_ARG="-v ${HOST_HF_CACHE_DIR}:/root/.cache/huggingface"
+    local cache_volume_arg=""
+    if [ "$build_profile_to_use" = "fast" ]; then
+        cache_volume_arg="-v ${HOST_HF_CACHE_DIR}:/root/.cache/huggingface"
     fi
-    local VOICE_STORE_VOLUME_ARG="-v ${HOST_VOICE_STORE_DIR}:${VOICE_STORAGE_DIR_TO_USE}"
+    local voice_store_volume_arg="-v ${HOST_VOICE_STORE_DIR}:${voice_storage_dir_to_use}"
 
-    local STARTUP_SCRIPT="#!/bin/bash
+    local startup_script="#!/bin/bash
 set -e
 exec > /var/log/startup-script.log 2>&1
 
-# Wait for NVIDIA drivers
 echo 'Waiting for NVIDIA drivers...'
 for i in \$(seq 1 60); do
     if nvidia-smi &>/dev/null; then break; fi
@@ -482,7 +595,6 @@ for i in \$(seq 1 60); do
 done
 nvidia-smi || { echo 'NVIDIA drivers not ready'; exit 1; }
 
-# Install Docker
 if ! command -v docker &>/dev/null; then
     echo 'Installing Docker...'
     curl -fsSL https://get.docker.com | sh
@@ -491,7 +603,6 @@ if ! command -v docker &>/dev/null; then
     echo 'Docker installed'
 fi
 
-# Install NVIDIA Container Toolkit
 if ! command -v nvidia-ctk &>/dev/null; then
     echo 'Installing NVIDIA Container Toolkit...'
     curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
@@ -504,32 +615,30 @@ if ! command -v nvidia-ctk &>/dev/null; then
     echo 'NVIDIA Container Toolkit installed'
 fi
 
-# Auth to Artifact Registry
-gcloud auth configure-docker ${REGION}-docker.pkg.dev --quiet 2>/dev/null || true
+gcloud auth configure-docker ${region}-docker.pkg.dev --quiet 2>/dev/null || true
 
-# Pull and run
 echo 'Pulling image...'
-docker pull ${IMAGE_TAG}
-docker rm -f ameego-tts 2>/dev/null || true
+docker pull ${image_tag}
+docker rm -f ${CONTAINER_NAME} 2>/dev/null || true
 mkdir -p ${HOST_HF_CACHE_DIR}
 mkdir -p ${HOST_VOICE_STORE_DIR}
 echo 'Starting container...'
 docker run -d \
-    --name ameego-tts \
+    --name ${CONTAINER_NAME} \
     --gpus all \
     --restart unless-stopped \
     -p ${SERVER_PORT}:${SERVER_PORT} \
-    ${CACHE_VOLUME_ARG} \
-    ${VOICE_STORE_VOLUME_ARG} \
-    ${DOCKER_ENV_ARGS} \
-    ${IMAGE_TAG}
+    ${cache_volume_arg} \
+    ${voice_store_volume_arg} \
+    ${docker_env_args} \
+    ${image_tag}
 
 echo 'Ameego TTS container started'
 "
 
-    local STARTUP_SCRIPT_FILE
-    STARTUP_SCRIPT_FILE="$(mktemp)"
-    printf '%s\n' "$STARTUP_SCRIPT" > "$STARTUP_SCRIPT_FILE"
+    local startup_script_file
+    startup_script_file="$(mktemp)"
+    printf '%s\n' "$startup_script" > "$startup_script_file"
 
     gcloud compute instances create "$INSTANCE_NAME" \
         --zone="$ZONE" \
@@ -541,38 +650,46 @@ echo 'Ameego TTS container started'
         --tags="$INSTANCE_NAME" \
         --scopes=cloud-platform \
         --maintenance-policy=TERMINATE \
-        --metadata-from-file="startup-script=${STARTUP_SCRIPT_FILE}" \
-        $SPOT_FLAG \
+        --metadata-from-file="startup-script=${startup_script_file}" \
+        $spot_flag \
         --quiet
 
-    rm -f "$STARTUP_SCRIPT_FILE"
-
-    # Save state
+    rm -f "$startup_script_file"
     save_deploy_env
 
-    # 5. Wait for health check
     log "Waiting for instance to be ready..."
     sleep 10
 
-    local IP=""
-    for i in $(seq 1 12); do
-        IP=$(get_external_ip)
-        if [ -n "$IP" ]; then break; fi
+    local ip=""
+    for _ in $(seq 1 12); do
+        ip="$(get_external_ip)"
+        if [ -n "$ip" ]; then
+            break
+        fi
         sleep 5
     done
 
-    if [ -z "$IP" ]; then
+    if [ -z "$ip" ]; then
         err "Could not get external IP"
         exit 1
     fi
 
-    log "External IP: ${IP}"
+    log "External IP: ${ip}"
+    if skip_health_check_enabled; then
+        warn "Skipping health wait because SKIP_HEALTH_CHECK=true"
+        if [ "$PROFILE" = "web" ]; then
+            echo "  Web UI:    http://${ip}:${SERVER_PORT}"
+        fi
+        echo "  WebSocket: ws://${ip}:${SERVER_PORT}/ws/tts"
+        echo "  Health:    http://${ip}:${SERVER_PORT}/health"
+        return 0
+    fi
     log "Waiting for server to be healthy (model loading may take a few minutes)..."
 
-    local HEALTHY=false
-    for i in $(seq 1 120); do
-        if curl -sf "http://${IP}:${SERVER_PORT}/health" &>/dev/null; then
-            HEALTHY=true
+    local healthy="false"
+    for _ in $(seq 1 120); do
+        if curl -sf "http://${ip}:${SERVER_PORT}/health" &>/dev/null; then
+            healthy="true"
             break
         fi
         printf "."
@@ -580,39 +697,48 @@ echo 'Ameego TTS container started'
     done
     echo ""
 
-    if [ "$HEALTHY" = true ]; then
+    if [ "$healthy" = "true" ]; then
         echo ""
         echo -e "${GREEN}╔══════════════════════════════════════╗${NC}"
         echo -e "${GREEN}║       Ameego TTS — Ready!            ║${NC}"
         echo -e "${GREEN}╚══════════════════════════════════════╝${NC}"
         echo ""
-        if [ "$APP_PROFILE_TO_USE" = "test" ]; then
-            echo -e "  ${CYAN}Web UI:${NC}     http://${IP}:${SERVER_PORT}"
+        if [ "$PROFILE" = "web" ]; then
+            echo -e "  ${CYAN}Web UI:${NC}     http://${ip}:${SERVER_PORT}"
         fi
-        echo -e "  ${CYAN}WebSocket:${NC}  ws://${IP}:${SERVER_PORT}/ws/tts"
-        echo -e "  ${CYAN}Health:${NC}     http://${IP}:${SERVER_PORT}/health"
+        echo -e "  ${CYAN}WebSocket:${NC}  ws://${ip}:${SERVER_PORT}/ws/tts"
+        echo -e "  ${CYAN}Health:${NC}     http://${ip}:${SERVER_PORT}/health"
         echo ""
-        echo -e "  ${CYAN}SSH:${NC}        ./deploy.sh ssh"
-        echo -e "  ${CYAN}Logs:${NC}       ./deploy.sh logs"
-        echo -e "  ${CYAN}Destroy:${NC}    ./deploy.sh down"
+        echo -e "  ${CYAN}SSH:${NC}        ./deploy.sh ssh --profile ${PROFILE}"
+        echo -e "  ${CYAN}Logs:${NC}       ./deploy.sh logs --profile ${PROFILE}"
+        echo -e "  ${CYAN}Destroy:${NC}    ./deploy.sh down --profile ${PROFILE}"
         echo ""
     else
         warn "Server not yet healthy. It may still be loading the model."
-        echo "  Check status:  ./deploy.sh status"
-        echo "  View logs:     ./deploy.sh logs"
-        if [ "$APP_PROFILE_TO_USE" = "test" ]; then
-            echo "  URL (when ready): http://${IP}:${SERVER_PORT}"
+        echo "  Check status:  ./deploy.sh status --profile ${PROFILE}"
+        echo "  View logs:     ./deploy.sh logs --profile ${PROFILE}"
+        if [ "$PROFILE" = "web" ]; then
+            echo "  URL (when ready): http://${ip}:${SERVER_PORT}"
         else
-            echo "  Health (when ready): http://${IP}:${SERVER_PORT}/health"
+            echo "  Health (when ready): http://${ip}:${SERVER_PORT}/health"
         fi
     fi
 }
 
 cmd_down() {
-    load_deploy_env
-    check_prerequisites
+    local requested_profile=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --profile) requested_profile="$2"; shift 2 ;;
+            *)
+                err "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
 
-    ZONE="${ZONE:-$DEFAULT_ZONE}"
+    prepare_instance_context "$requested_profile"
 
     echo ""
     echo -e "${YELLOW}╔══════════════════════════════════════╗${NC}"
@@ -629,15 +755,26 @@ cmd_down() {
     gcloud compute firewall-rules delete "$FIREWALL_RULE" \
         --quiet 2>/dev/null || warn "Firewall rule not found"
 
-    rm -f "$DEPLOY_ENV"
+    if [ "${DEPLOY_PROFILE:-}" = "$PROFILE" ]; then
+        rm -f "$DEPLOY_ENV"
+    fi
     log "Cleanup complete"
 }
 
 cmd_status() {
-    load_deploy_env
-    check_prerequisites
+    local requested_profile=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --profile) requested_profile="$2"; shift 2 ;;
+            *)
+                err "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
 
-    ZONE="${ZONE:-$DEFAULT_ZONE}"
+    prepare_instance_context "$requested_profile"
 
     echo ""
     gcloud compute instances describe "$INSTANCE_NAME" \
@@ -647,83 +784,113 @@ cmd_status() {
         return 1
     }
 
-    local IP=$(get_external_ip)
-    if [ -n "$IP" ]; then
+    local ip
+    ip="$(get_external_ip)"
+    if [ -n "$ip" ]; then
         echo ""
-        echo "  Profile:   ${APP_PROFILE:-$DEFAULT_APP_PROFILE}"
-        echo "  Build:     ${BUILD_PROFILE:-$(default_build_profile_for_app_profile "${APP_PROFILE:-$DEFAULT_APP_PROFILE}")}"
-        if curl -sf "http://${IP}:${SERVER_PORT}/health" 2>/dev/null; then
+        echo "  Profile:   ${PROFILE}"
+        echo "  Build:     ${DEPLOY_BUILD_PROFILE:-$(default_build_profile_for_profile "$PROFILE")}"
+        if curl -sf "http://${ip}:${SERVER_PORT}/health" 2>/dev/null; then
             echo ""
             log "Health: ${GREEN}OK${NC}"
         else
             warn "Health: NOT READY (model may still be loading)"
         fi
         echo ""
-        if [ "${APP_PROFILE:-$DEFAULT_APP_PROFILE}" = "test" ]; then
-            echo "  Web UI:    http://${IP}:${SERVER_PORT}"
+        if [ "$PROFILE" = "web" ]; then
+            echo "  Web UI:    http://${ip}:${SERVER_PORT}"
         fi
-        echo "  WebSocket: ws://${IP}:${SERVER_PORT}/ws/tts"
+        echo "  WebSocket: ws://${ip}:${SERVER_PORT}/ws/tts"
     fi
 }
 
 cmd_ssh() {
-    load_deploy_env
-    check_prerequisites
+    local requested_profile=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --profile) requested_profile="$2"; shift 2 ;;
+            *)
+                err "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
 
-    ZONE="${ZONE:-$DEFAULT_ZONE}"
+    prepare_instance_context "$requested_profile"
     gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE"
 }
 
 cmd_logs() {
-    load_deploy_env
-    check_prerequisites
+    local requested_profile=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --profile) requested_profile="$2"; shift 2 ;;
+            *)
+                err "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
 
-    ZONE="${ZONE:-$DEFAULT_ZONE}"
+    prepare_instance_context "$requested_profile"
     gcloud compute ssh "$INSTANCE_NAME" --zone="$ZONE" \
-        --command="docker logs --tail 100 -f ameego-tts 2>&1"
+        --command="docker logs --tail 100 -f ${CONTAINER_NAME} 2>&1"
 }
 
 cmd_url() {
-    load_deploy_env
-    check_prerequisites
-    ZONE="${ZONE:-$DEFAULT_ZONE}"
+    local requested_profile=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --profile) requested_profile="$2"; shift 2 ;;
+            *)
+                err "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
 
-    local IP=$(get_external_ip)
-    if [ -n "$IP" ]; then
-        echo "http://${IP}:${SERVER_PORT}"
+    prepare_instance_context "$requested_profile"
+
+    local ip
+    ip="$(get_external_ip)"
+    if [ -n "$ip" ]; then
+        echo "http://${ip}:${SERVER_PORT}"
     else
         err "Could not get external IP. Is the instance running?"
         exit 1
     fi
 }
 
-# ---- Main ---------------------------------------------------
-
 case "${1:-help}" in
-    up)     shift; cmd_up "$@" ;;
-    down)   cmd_down ;;
-    status) cmd_status ;;
-    ssh)    cmd_ssh ;;
-    logs)   cmd_logs ;;
-    url)    cmd_url ;;
+    up)
+        shift
+        cmd_up "$@"
+        ;;
+    down)
+        shift
+        cmd_down "$@"
+        ;;
+    status)
+        shift
+        cmd_status "$@"
+        ;;
+    ssh)
+        shift
+        cmd_ssh "$@"
+        ;;
+    logs)
+        shift
+        cmd_logs "$@"
+        ;;
+    url)
+        shift
+        cmd_url "$@"
+        ;;
     *)
-        echo "Usage: $0 {up|down|status|ssh|logs|url}"
-        echo ""
-        echo "Commands:"
-        echo "  up [--model 0.6B|1.7B] [--profile test|api] [--build full|fast] [--spot] [--zone ZONE]  Deploy TTS server"
-        echo "  down                                             Destroy server"
-        echo "  status                                           Show server status"
-        echo "  ssh                                              SSH into server"
-        echo "  logs                                             View server logs"
-        echo "  url                                              Print server URL"
-        echo ""
-        echo "Examples:"
-        echo "  $0 up                                            Deploy test profile using default full image"
-        echo "  $0 up --profile api                             Deploy API-only profile using default fast image"
-        echo "  $0 up --profile api --build full                Deploy API-only profile with baked-in models"
-        echo "  $0 up --model 1.7B --spot                       Deploy test profile defaulting to 1.7B on spot"
-        echo "  MODEL_SIZES=0.6B $0 up                          Deploy only the 0.6B model"
-        echo "  $0 up --zone us-west2-b                         Deploy in specific zone"
+        usage
         exit 1
         ;;
 esac

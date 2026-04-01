@@ -2,55 +2,49 @@
 
 Streaming TTS server based on Qwen3-TTS and `faster-qwen3-tts`.
 
-Default deployment target:
-- model: `1.7B`
-- GPU: `NVIDIA L4`
-
-Main docs:
 - API: [docs/api.md](docs/api.md)
 - Deploy: [docs/deploy.md](docs/deploy.md)
 
-## Quick Start
+## Architecture
 
-Default deploy:
-
-```bash
-./deploy.sh up
+```text
+Client ──HTTP / WebSocket──> FastAPI ──> runtime pool ──> Qwen3-TTS models (GPU)
 ```
 
-API-only deploy:
+## Quick Start
 
 ```bash
+./deploy.sh up --profile web
 ./deploy.sh up --profile api
 ```
 
-Common commands:
+## Profiles
+
+- `web`: bundled browser UI, manual testing, runtime mode switching
+- `api`: API-first deployment, no bundled web UI
+
+## Operations
 
 ```bash
-./deploy.sh status
-./deploy.sh logs
-./deploy.sh ssh
-./deploy.sh down
+./deploy.sh status --profile api
+./deploy.sh logs --profile api
+./deploy.sh ssh --profile api
+./deploy.sh url --profile api
+./deploy.sh down --profile api
 ```
 
-## Repo Layout
+## Configuration
 
-- `server/`: FastAPI server, runtime pool, WebSocket protocol, voice storage
-- `web/`: bundled test UI
-- `scripts/`: build-time helper scripts
-- `docs/`: operator and integration docs
+- model: `0.6B` or `1.7B`
+- build: `full` or `fast`
+- optional multi-model preload and voice-design enablement
+- single active profile at a time
 
-## Defaults
+## Local Development
 
-- default app profile: `test`
-- default model: `1.7B`
-- default test build: `full`
-- default api build: `fast`
-- default WebSocket connection limit: `8`
-- default extra waiting synth requests: `1`
+- runtime still uses an internal `test` app profile for the web variant
+- the external operating contract is `web|api`
 
 ## Notes
 
-- `test` serves the bundled web UI and supports runtime mode switching
-- `api` disables the web UI and `/mode/switch`
-- durable cloned voices are stored via `voice_id` in `VOICE_STORAGE_DIR`
+- The shared deployment contract lives in the `ameego-gateway/OPERATIONS.md` workspace doc.
