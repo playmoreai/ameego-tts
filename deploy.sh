@@ -371,24 +371,40 @@ ensure_private_egress() {
     local region="$1"
     local router="ameego-private-egress-${region}"
     local nat="${router}-nat"
+    local attempt=""
+    local updated="false"
 
     log "Ensuring private egress in ${region}..." >&2
-    gcloud compute networks subnets update default \
-        --region="$region" \
-        --enable-private-ip-google-access \
-        --quiet >/dev/null
+    for attempt in 1 2 3; do
+        if gcloud compute networks subnets update default \
+            --region="$region" \
+            --enable-private-ip-google-access \
+            --quiet >/dev/null 2>&1; then
+            updated="true"
+            break
+        fi
+        sleep 5
+    done
+    if [ "$updated" != "true" ]; then
+        err "Failed to enable Private Google Access for region ${region}"
+        exit 1
+    fi
 
-    gcloud compute routers create "$router" \
-        --network=default \
-        --region="$region" \
-        --quiet >/dev/null 2>&1 || true
+    if ! gcloud compute routers describe "$router" --region="$region" >/dev/null 2>&1; then
+        gcloud compute routers create "$router" \
+            --network=default \
+            --region="$region" \
+            --quiet >/dev/null
+    fi
 
-    gcloud compute routers nats create "$nat" \
-        --router="$router" \
-        --region="$region" \
-        --nat-all-subnet-ip-ranges \
-        --auto-allocate-nat-external-ips \
-        --quiet >/dev/null 2>&1 || true
+    if ! gcloud compute routers nats describe "$nat" --router="$router" --region="$region" >/dev/null 2>&1; then
+        gcloud compute routers nats create "$nat" \
+            --router="$router" \
+            --region="$region" \
+            --nat-all-subnet-ip-ranges \
+            --auto-allocate-nat-external-ips \
+            --quiet >/dev/null
+    fi
 }
 
 other_profile_instance_exists() {
@@ -748,10 +764,9 @@ if ! command -v nvidia-ctk &>/dev/null; then
     echo 'NVIDIA Container Toolkit installed'
 fi
 
-gcloud auth configure-docker ${region}-docker.pkg.dev --quiet 2>/dev/null || true
-ACCESS_TOKEN=\$(curl -fsSL -H "Metadata-Flavor: Google" \
-    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+ACCESS_TOKEN=\$(curl -fsSL -H \"Metadata-Flavor: Google\" \
+    \"http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token\" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)['\''access_token'\''])')
 docker login -u oauth2accesstoken -p "\${ACCESS_TOKEN}" https://${region}-docker.pkg.dev
 
 echo 'Pulling image...'
@@ -796,7 +811,10 @@ echo 'Ameego TTS container started'
     if [ -n "$spot_flag" ]; then
         create_args+=("$spot_flag")
     fi
-    gcloud compute instances create "$INSTANCE_NAME" "${create_args[@]}"
+    if ! gcloud compute instances create "$INSTANCE_NAME" "${create_args[@]}"; then
+        rm -f "$startup_script_file"
+        exit 1
+    fi
 
     rm -f "$startup_script_file"
 
